@@ -1,0 +1,11 @@
+[Unit]
+Description=stackctl: back up data folders (DATA_DIRS) to Borg
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/stackctl data
+TimeoutStartSec=12h
+Nice=10
+IOSchedulingClass=idle

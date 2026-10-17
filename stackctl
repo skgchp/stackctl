@@ -1,0 +1,856 @@
+#!/usr/bin/env bash
+#
+# stackctl: pull-based deploys with Borg backups for Docker Compose stacks.
+#
+# Watches the main branch of a GitHub repo. When a stack's folder changes it
+# backs the stack up to Borg (stopped, so the backup is consistent), writes
+# out the new files, then runs docker compose pull and up -d.
+#
+# Run "stackctl help" for the list of commands.
+
+set -Eeuo pipefail
+
+VERSION="1.0.0"
+CONFIG_FILE="${STACKCTL_CONFIG:-$HOME/.config/stackctl/stackctl.conf}"
+COMPOSE_NAMES=(compose.yaml compose.yml docker-compose.yaml docker-compose.yml)
+STACK_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/stackctl"
+GIT_DIR_PATH="$STATE_DIR/repo.git"
+LOCK_FILE="$RUNTIME_DIR/stackctl.lock"
+HOST="$(hostname -s)"
+
+# Non-interactive sessions (systemd, cron, SSH) don't load your shell
+# profile, so set up what rootless Docker needs explicitly.
+export PATH="$HOME/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export DOCKER_HOST="${DOCKER_HOST:-unix://$RUNTIME_DIR/docker.sock}"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+stackctl: pull-based deploys with Borg backups for Docker Compose stacks
+
+Everyday commands:
+  test [--no-notify]          Check everything works, including a Borg backup
+                              and restore round trip, then show a dry run
+  status                      Show each stack's deployed version and state
+  update [--dry-run]          Deploy changes from GitHub (run hourly by systemd)
+
+Backups:
+  list <stack>                List a stack's backups
+  restore <stack> [archive]   Restore a stack (prompts you to pick if no archive)
+                              Add --yes to skip the confirmation
+  extract <stack> <archive> <dir>
+                              Copy a backup into <dir> for browsing, without
+                              touching the running stack
+  backup <stack>... [--stop]  Take a manual backup (kept until you delete it)
+  nightly                     Back up all stacks and prune (run nightly by systemd)
+  data                        Back up the folders in DATA_DIRS as separate archive
+                              series, then prune them (own systemd timer)
+
+Holds:
+  hold <stack> [reason]       Stop automatic updates for a stack
+  release <stack>             Resume automatic updates for a stack
+
+Setup and housekeeping:
+  init                        Create the Borg repo and export its key (first run)
+  adopt                       Mark stacks already running as deployed, without
+                              restarting them (first run on an existing server)
+  clean                       Delete folders set aside by past restores
+  help                        Show this help
+EOF
+}
+
+load_config() {
+  [[ -f $CONFIG_FILE ]] || die "config file not found: $CONFIG_FILE"
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+
+  : "${STACKS_DIR:?STACKS_DIR is not set in $CONFIG_FILE}"
+  : "${GIT_REMOTE:?GIT_REMOTE is not set in $CONFIG_FILE}"
+  : "${BORG_REPO:?BORG_REPO is not set in $CONFIG_FILE}"
+  : "${BORG_PASSCOMMAND:?BORG_PASSCOMMAND is not set in $CONFIG_FILE}"
+
+  BRANCH="${BRANCH:-main}"
+  KEEP_DAILY="${KEEP_DAILY:-3}"
+  KEEP_WEEKLY="${KEEP_WEEKLY:-3}"
+  KEEP_MONTHLY="${KEEP_MONTHLY:-3}"
+  KEEP_PRE="${KEEP_PRE:-3}"
+  DATA_DIRS="${DATA_DIRS:-}"
+  KEEP_DATA_DAILY="${KEEP_DATA_DAILY:-7}"
+  KEEP_DATA_WEEKLY="${KEEP_DATA_WEEKLY:-4}"
+  KEEP_DATA_MONTHLY="${KEEP_DATA_MONTHLY:-3}"
+  NOTIFY_SUCCESS="${NOTIFY_SUCCESS:-true}"
+  NOTIFY_NIGHTLY_SUCCESS="${NOTIFY_NIGHTLY_SUCCESS:-false}"
+  TRASH_DIR="$STACKS_DIR/.stackctl-trash"
+
+  export BORG_REPO BORG_PASSCOMMAND
+  if [[ -n ${BORG_RSH:-} ]]; then export BORG_RSH; fi
+  if [[ -n ${BORG_REMOTE_PATH:-} ]]; then export BORG_REMOTE_PATH; fi
+  if [[ -n ${GITHUB_SSH_KEY:-} ]]; then
+    local key_q
+    key_q="$(printf '%q' "$GITHUB_SSH_KEY")"
+    export GIT_SSH_COMMAND="ssh -i $key_q -o IdentitiesOnly=yes -o BatchMode=yes"
+  fi
+
+  mkdir -p "$STATE_DIR/deployed" "$STATE_DIR/holds" "$STATE_DIR/removed"
+}
+
+short_or() { if [[ -n ${1:-} ]]; then printf '%s' "${1:0:7}"; else printf '%s' "$2"; fi; }
+
+valid_stack() { [[ ${1:-} =~ $STACK_RE ]] || die "invalid stack name: '${1:-}'"; }
+
+notify() { # priority title message
+  [[ -n ${NTFY_URL:-} ]] || return 0
+  local args=(-fsS -m 15 -H "Title: $HOST: $2" -H "Priority: $1" --data-binary "$3")
+  if [[ -n ${NTFY_TOKEN:-} ]]; then args+=(-H "Authorization: Bearer $NTFY_TOKEN"); fi
+  case $1 in
+    high | urgent) args+=(-H "Tags: warning") ;;
+    *) args+=(-H "Tags: white_check_mark") ;;
+  esac
+  curl "${args[@]}" "$NTFY_URL" > /dev/null || log "Could not send notification: $2"
+}
+
+on_unexpected_error() {
+  log "Unexpected error at line $1"
+  notify high "stackctl error" "stackctl stopped with an unexpected error at line $1. Check the journal for details."
+}
+
+take_lock() { # seconds to wait, 0 = don't wait
+  exec 9> "$LOCK_FILE"
+  if [[ $1 == 0 ]]; then flock -n 9; else flock -w "$1" 9; fi
+}
+
+# Run a command inside rootless Docker's user namespace. There, your user
+# acts as root over files owned by container users (your subordinate UIDs),
+# so backups can read everything and restores keep the right ownership.
+in_userns() {
+  local pid
+  pid="$(cat "$RUNTIME_DIR/docker.pid" 2> /dev/null)" || {
+    log "rootless Docker pid file not found at $RUNTIME_DIR/docker.pid"
+    return 1
+  }
+  nsenter -U --preserve-credentials -t "$pid" -- "$@"
+}
+
+dc() { # stack, docker compose args...
+  local s=$1
+  shift
+  (cd "$STACKS_DIR/$s" && docker compose "$@")
+}
+
+# ---------------------------------------------------------------------------
+# Git
+# ---------------------------------------------------------------------------
+
+g() { git --git-dir="$GIT_DIR_PATH" "$@"; }
+
+fetch_repo() {
+  if [[ ! -d $GIT_DIR_PATH ]]; then git init -q --bare "$GIT_DIR_PATH"; fi
+  g config remote.origin.url "$GIT_REMOTE"
+  g fetch -q origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+}
+
+target_rev() { g rev-parse "refs/remotes/origin/$BRANCH"; }
+
+rev_exists() { [[ -n ${1:-} ]] && g cat-file -e "$1^{commit}" 2> /dev/null; }
+
+compose_name_at() { # rev stack
+  local n
+  for n in "${COMPOSE_NAMES[@]}"; do
+    if g cat-file -e "$1:$2/$n" 2> /dev/null; then
+      printf '%s' "$n"
+      return 0
+    fi
+  done
+  return 1
+}
+
+stacks_at() { # rev
+  local d
+  while IFS= read -r d; do
+    [[ $d =~ $STACK_RE ]] || continue
+    if compose_name_at "$1" "$d" > /dev/null; then printf '%s\n' "$d"; fi
+  done < <(g ls-tree -d --name-only "$1")
+}
+
+has_compose_dir() {
+  local n
+  for n in "${COMPOSE_NAMES[@]}"; do
+    [[ -f "$STACKS_DIR/$1/$n" ]] && return 0
+  done
+  return 1
+}
+
+local_stacks() {
+  local d name
+  for d in "$STACKS_DIR"/*/; do
+    [[ -d $d ]] || continue
+    name="$(basename "$d")"
+    [[ $name =~ $STACK_RE ]] || continue
+    if has_compose_dir "$name"; then printf '%s\n' "$name"; fi
+  done
+}
+
+read_file() { if [[ -r $1 ]]; then cat -- "$1"; else in_userns cat -- "$1"; fi; }
+
+# Print tracked files in a stack whose contents differ from the given revision.
+local_changes() { # stack rev
+  local meta f mode sha path
+  while IFS=$'\t' read -r -d '' meta f; do
+    mode="${meta%% *}"
+    sha="${meta##* }"
+    path="$STACKS_DIR/$f"
+    [[ $mode == 160000 ]] && continue
+    if [[ $mode == 120000 ]]; then
+      if [[ ! -L $path || "$(readlink -- "$path")" != "$(g cat-file blob "$sha")" ]]; then
+        printf '%s\n' "$f"
+      fi
+    elif [[ ! -f $path ]] || ! cmp -s <(g cat-file blob "$sha") <(read_file "$path"); then
+      printf '%s\n' "$f"
+    fi
+  done < <(g ls-tree -r -z "$2" -- "$1")
+}
+
+# Write a stack's files from the target revision, removing tracked files
+# that were deleted since the old revision. Untracked files (data, .env)
+# are never touched.
+apply_stack_files() { # stack old target
+  local f
+  if [[ -n $2 ]]; then
+    while IFS= read -r -d '' f; do
+      in_userns rm -f -- "$STACKS_DIR/$f" || return 1
+    done < <(g diff -z --no-renames --name-only --diff-filter=D "$2" "$3" -- "$1")
+  fi
+  mkdir -p "$STACKS_DIR"
+  g archive --format=tar "$3" "$1" | (cd "$STACKS_DIR" && in_userns tar -x --no-same-owner -f -)
+}
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+deployed_rev() { if [[ -f "$STATE_DIR/deployed/$1" ]]; then cat "$STATE_DIR/deployed/$1"; fi; }
+set_deployed() { printf '%s\n' "$2" > "$STATE_DIR/deployed/$1"; }
+is_held() { [[ -f "$STATE_DIR/holds/$1" ]]; }
+hold_stack() { printf '%s %s\n' "$(date '+%F %T')" "$2" > "$STATE_DIR/holds/$1"; }
+
+# ---------------------------------------------------------------------------
+# Borg
+# ---------------------------------------------------------------------------
+
+backup_stack() { # stack kind rev
+  local name
+  name="$1@$2@$(date +%Y-%m-%dT%H%M%S)@${3:0:7}"
+  log "Backing up $1 to archive $name"
+  (cd "$STACKS_DIR" && in_userns borg create --numeric-ids --exclude-caches \
+    --compression zstd,6 "::$name" "$1")
+}
+
+prune_all() {
+  local stack failed=0
+  local -a stacks
+  mapfile -t stacks < <(borg list --short | cut -d@ -f1 | sort -u | grep -E "$STACK_RE" || true)
+  for stack in "${stacks[@]}"; do
+    borg prune --glob-archives "$stack@nightly@*" --keep-daily "$KEEP_DAILY" \
+      --keep-weekly "$KEEP_WEEKLY" --keep-monthly "$KEEP_MONTHLY" || failed=1
+    borg prune --glob-archives "$stack@pre@*" --keep-last "$KEEP_PRE" || failed=1
+  done
+  borg compact || failed=1
+  return "$failed"
+}
+
+# Folders outside the stacks (for example a mounted volume) are backed up as their own series,
+# named after the folder: <name>@data@<time>@none. They never take part in stack updates or prunes.
+backup_data() { # absolute folder
+  local name archive
+  name="$(basename "$1")"
+  valid_stack "$name"
+  [[ -d $1 ]] || {
+    log "data folder not found: $1"
+    return 1
+  }
+  archive="$name@data@$(date +%Y-%m-%dT%H%M%S)@none"
+  log "Backing up $1 to archive $archive"
+  (cd "$(dirname "$1")" && in_userns borg create --numeric-ids --exclude-caches \
+    --exclude '*/lost+found' --compression auto,zstd,3 "::$archive" "$name")
+}
+
+prune_data() { # absolute folder
+  local name
+  name="$(basename "$1")"
+  borg prune --glob-archives "$name@data@*" --keep-daily "$KEEP_DATA_DAILY" \
+    --keep-weekly "$KEEP_DATA_WEEKLY" --keep-monthly "$KEEP_DATA_MONTHLY"
+}
+
+# ---------------------------------------------------------------------------
+# update
+# ---------------------------------------------------------------------------
+
+prepull() { # stack target
+  local n
+  n="$(compose_name_at "$2" "$1")" || return 0
+  g show "$2:$1/$n" | docker compose --project-directory "$STACKS_DIR/$1" -f - pull --quiet
+}
+
+deploy_stack() { # stack old target
+  local stack=$1 old=$2 target=$3 dir="$STACKS_DIR/$1" changes msg
+  log "Updating $stack: $(short_or "$old" "not deployed") -> ${target:0:7}"
+
+  if [[ -d $dir && -n $old ]]; then
+    changes="$(local_changes "$stack" "$old")"
+    if [[ -n $changes ]]; then
+      hold_stack "$stack" "local changes to tracked files"
+      printf -v msg 'These tracked files were changed on the server, so the update was skipped and %s is on hold:\n%s\n\nCommit the changes to GitHub or undo them, then run: stackctl release %s' \
+        "$stack" "$changes" "$stack"
+      notify high "$stack not updated" "$msg"
+      return 1
+    fi
+  fi
+
+  if [[ -d $dir ]]; then
+    if has_compose_dir "$stack"; then
+      prepull "$stack" "$target" || log "Pre-pull failed for $stack, will pull after the backup instead"
+      if ! dc "$stack" stop; then
+        dc "$stack" start || true
+        notify high "$stack not updated" "Could not stop $stack for its pre-update backup. It will be retried next hour."
+        return 1
+      fi
+    fi
+    if ! backup_stack "$stack" pre "${old:-none}"; then
+      if has_compose_dir "$stack"; then dc "$stack" start || true; fi
+      notify high "$stack not updated" "The pre-update backup of $stack failed, so it was restarted unchanged. It will be retried next hour."
+      return 1
+    fi
+  fi
+
+  if ! apply_stack_files "$stack" "$old" "$target"; then
+    hold_stack "$stack" "files could not be updated to ${target:0:7}"
+    notify urgent "$stack is down" "The new files for $stack could not be written, so it is stopped and on hold. Roll back with: stackctl restore $stack"
+    return 1
+  fi
+
+  if dc "$stack" pull --quiet && dc "$stack" up -d --remove-orphans; then
+    set_deployed "$stack" "$target"
+    log "Updated $stack"
+    return 0
+  fi
+
+  hold_stack "$stack" "failed to start after update to ${target:0:7}"
+  printf -v msg '%s failed to start after updating to %s and is on hold.\n\nCheck with: docker compose logs (in %s)\nThen either fix it and run: stackctl release %s\nor roll back with: stackctl restore %s' \
+    "$stack" "${target:0:7}" "$dir" "$stack" "$stack"
+  notify urgent "$stack failed to start" "$msg"
+  return 1
+}
+
+cmd_update() {
+  local dry=false stack old target f
+  local -a stacks updated=() failed=() held=()
+  if [[ ${1:-} == --dry-run ]]; then dry=true; fi
+
+  if ! $dry; then
+    trap 'on_unexpected_error $LINENO' ERR
+    if ! take_lock 0; then
+      log "Another stackctl run is in progress, skipping this one"
+      return 0
+    fi
+  fi
+
+  if ! fetch_repo; then
+    if ! $dry && [[ ! -f $STATE_DIR/fetch-failing ]]; then
+      touch "$STATE_DIR/fetch-failing"
+      notify high "Cannot reach GitHub" "Could not fetch $GIT_REMOTE. Updates are paused until it works again; you'll get one more notification when it recovers."
+    fi
+    die "could not fetch $GIT_REMOTE"
+  fi
+  if ! $dry && [[ -f $STATE_DIR/fetch-failing ]]; then
+    rm -f "$STATE_DIR/fetch-failing"
+    notify default "GitHub reachable again" "Fetching from GitHub works again."
+  fi
+
+  target="$(target_rev)"
+  mapfile -t stacks < <(stacks_at "$target")
+
+  for stack in "${stacks[@]}"; do
+    old="$(deployed_rev "$stack")"
+    [[ $old == "$target" ]] && continue
+    rev_exists "$old" || old=""
+
+    # Nothing in this stack changed, just move its marker along.
+    if [[ -n $old ]] && g diff --quiet "$old" "$target" -- "$stack"; then
+      $dry || set_deployed "$stack" "$target"
+      continue
+    fi
+
+    if is_held "$stack"; then
+      held+=("$stack")
+      continue
+    fi
+
+    if $dry; then
+      printf 'Would update %s (%s -> %s)\n' "$stack" "$(short_or "$old" "not deployed")" "${target:0:7}"
+      updated+=("$stack")
+      continue
+    fi
+
+    if deploy_stack "$stack" "$old" "$target"; then
+      updated+=("$stack")
+    else
+      failed+=("$stack")
+    fi
+  done
+
+  if $dry; then
+    if (( ${#updated[@]} == 0 )); then echo "Nothing to update, all stacks match ${target:0:7}"; fi
+    if (( ${#held[@]} > 0 )); then echo "On hold with changes waiting: ${held[*]}"; fi
+    return 0
+  fi
+
+  # Stacks that have disappeared from the repo are left running.
+  for f in "$STATE_DIR"/deployed/*; do
+    [[ -e $f ]] || continue
+    stack="${f##*/}"
+    if ! printf '%s\n' "${stacks[@]}" | grep -qxF -- "$stack"; then
+      mv "$f" "$STATE_DIR/removed/$stack"
+      notify high "$stack removed from repo" "$stack is no longer in the repo but is still running. When ready, run 'docker compose down' in $STACKS_DIR/$stack. Its backups are kept."
+    fi
+  done
+
+  if (( ${#updated[@]} > 0 )) && [[ $NOTIFY_SUCCESS == true ]]; then
+    notify default "Updated ${updated[*]}" "Deployed ${target:0:7}: $(g log -1 --format=%s "$target")"
+  fi
+  if (( ${#held[@]} > 0 )); then log "On hold with changes waiting: ${held[*]}"; fi
+  if (( ${#failed[@]} > 0 )); then
+    log "Failed: ${failed[*]}"
+    exit 1
+  fi
+  log "Update run complete at ${target:0:7}"
+}
+
+# ---------------------------------------------------------------------------
+# nightly / backup
+# ---------------------------------------------------------------------------
+
+cmd_nightly() {
+  local stack rev
+  local -a stacks failed=()
+  trap 'on_unexpected_error $LINENO' ERR
+  take_lock 3600 || die "could not get the lock after waiting an hour"
+
+  mapfile -t stacks < <(local_stacks)
+  for stack in "${stacks[@]}"; do
+    rev="$(deployed_rev "$stack")"
+    if [[ -f "$STACKS_DIR/$stack/.backup-stop" ]]; then
+      log "Stopping $stack for its nightly backup"
+      if dc "$stack" stop && backup_stack "$stack" nightly "${rev:-none}"; then :; else failed+=("$stack"); fi
+      dc "$stack" start || failed+=("$stack (restart)")
+    else
+      backup_stack "$stack" nightly "${rev:-none}" || failed+=("$stack")
+    fi
+  done
+
+  prune_all || failed+=("prune")
+
+  if (( ${#failed[@]} > 0 )); then
+    notify high "Nightly backup problems" "These failed: ${failed[*]}. Check the journal for details."
+    exit 1
+  fi
+  if [[ $NOTIFY_NIGHTLY_SUCCESS == true ]]; then
+    notify default "Nightly backup done" "Backed up ${#stacks[@]} stacks."
+  fi
+  log "Nightly backup complete"
+}
+
+cmd_data() {
+  local dir
+  local -a failed=() dirs=()
+  trap 'on_unexpected_error $LINENO' ERR
+  read -r -a dirs <<< "$DATA_DIRS"
+  (( ${#dirs[@]} > 0 )) || die "DATA_DIRS is not set in $CONFIG_FILE"
+  take_lock 3600 || die "could not get the lock after waiting an hour"
+
+  for dir in "${dirs[@]}"; do
+    backup_data "$dir" || {
+      failed+=("$dir")
+      continue
+    }
+    prune_data "$dir" || failed+=("prune $dir")
+  done
+  borg compact || failed+=("compact")
+
+  if (( ${#failed[@]} > 0 )); then
+    notify high "Data backup problems" "These failed: ${failed[*]}. Check the journal for details."
+    exit 1
+  fi
+  if [[ $NOTIFY_NIGHTLY_SUCCESS == true ]]; then
+    notify default "Data backup done" "Backed up ${#dirs[@]} folder(s): ${dirs[*]}."
+  fi
+  log "Data backup complete"
+}
+
+cmd_backup() {
+  local stop=false stack rev a
+  local -a stacks=()
+  for a in "$@"; do
+    if [[ $a == --stop ]]; then stop=true; else valid_stack "$a"; stacks+=("$a"); fi
+  done
+  (( ${#stacks[@]} > 0 )) || die "usage: stackctl backup <stack>... [--stop]"
+  take_lock 600 || die "another stackctl run is in progress, try again shortly"
+
+  for stack in "${stacks[@]}"; do
+    has_compose_dir "$stack" || die "no stack called $stack in $STACKS_DIR"
+    rev="$(deployed_rev "$stack")"
+    if $stop; then dc "$stack" stop; fi
+    backup_stack "$stack" manual "${rev:-none}" || { $stop && dc "$stack" start; die "backup of $stack failed"; }
+    if $stop; then dc "$stack" start; fi
+  done
+  log "Done. Manual backups are not pruned; delete them with 'borg delete ::<archive>' when no longer needed."
+}
+
+# ---------------------------------------------------------------------------
+# list / extract / restore
+# ---------------------------------------------------------------------------
+
+cmd_list() {
+  valid_stack "${1:-}"
+  borg list --glob-archives "$1@*" --sort-by timestamp --format '{archive:<70} {time}{NL}'
+}
+
+cmd_extract() {
+  local stack=${1:-} archive=${2:-} dest=${3:-}
+  valid_stack "$stack"
+  [[ -n $archive && -n $dest ]] || die "usage: stackctl extract <stack> <archive> <dir>"
+  [[ $archive == "$stack@"* ]] || die "archive $archive does not belong to $stack"
+  mkdir -p "$dest"
+  (cd "$dest" && borg extract "::$archive" "$stack")
+  echo "Extracted to $dest/$stack. Files are owned by you; original ownership is not kept."
+}
+
+cmd_restore() {
+  local stack="" archive="" yes=false a n answer saved="" rev_short full dir
+  local -a archives
+  for a in "$@"; do
+    case $a in
+      --yes) yes=true ;;
+      *) if [[ -z $stack ]]; then stack=$a; else archive=$a; fi ;;
+    esac
+  done
+  valid_stack "$stack"
+  dir="$STACKS_DIR/$stack"
+
+  if [[ -z $archive ]]; then
+    mapfile -t archives < <(borg list --short --sort-by timestamp --glob-archives "$stack@*" | tac)
+    (( ${#archives[@]} > 0 )) || die "no backups found for $stack"
+    [[ -t 0 ]] || die "no archive given and not running interactively"
+    echo "Backups of $stack, newest first:"
+    for i in "${!archives[@]}"; do printf '%3d) %s\n' "$((i + 1))" "${archives[$i]}"; done
+    read -rp "Restore which number? " n
+    if ! [[ $n =~ ^[0-9]+$ ]] || (( n < 1 || n > ${#archives[@]} )); then die "not a valid choice"; fi
+    archive="${archives[$((n - 1))]}"
+  fi
+  [[ $archive == "$stack@"* ]] || die "archive $archive does not belong to $stack"
+  borg info "::$archive" > /dev/null || die "archive $archive not found"
+
+  if ! $yes; then
+    cat <<EOF
+
+This will:
+  1. put $stack on hold, so hourly updates leave it alone
+  2. stop $stack and move its current folder into $TRASH_DIR
+  3. restore $stack from $archive and start it
+
+EOF
+    read -rp "Type the stack name to continue: " answer
+    [[ $answer == "$stack" ]] || die "cancelled"
+  fi
+
+  take_lock 600 || die "another stackctl run is in progress, try again shortly"
+  hold_stack "$stack" "restored from $archive"
+
+  if [[ -d $dir ]]; then
+    if has_compose_dir "$stack"; then dc "$stack" down || log "Warning: 'docker compose down' failed for $stack"; fi
+    mkdir -p "$TRASH_DIR"
+    saved="$TRASH_DIR/$stack.$(date +%Y%m%dT%H%M%S)"
+    mv "$dir" "$saved"
+    log "Moved the current folder to $saved"
+  fi
+
+  if ! (cd "$STACKS_DIR" && in_userns borg extract --numeric-ids "::$archive" "$stack"); then
+    log "Restore failed"
+    if [[ -d $dir ]]; then in_userns rm -rf -- "$dir"; fi
+    if [[ -n $saved ]]; then mv "$saved" "$dir" && log "Put the previous folder back"; fi
+    die "restore of $stack failed; it is stopped and on hold"
+  fi
+
+  # Record the Git revision the backup was taken at, if the archive knows it.
+  rev_short="${archive##*@}"
+  if full="$(g rev-parse -q --verify "${rev_short}^{commit}" 2> /dev/null)"; then
+    set_deployed "$stack" "$full"
+  else
+    rm -f "$STATE_DIR/deployed/$stack"
+  fi
+
+  dc "$stack" up -d || die "$stack was restored but failed to start. Check 'docker compose logs' in $dir"
+  notify default "$stack restored" "Restored from $archive. It is on hold until you run: stackctl release $stack"
+
+  cat <<EOF
+
+$stack is running from $archive and is ON HOLD.
+
+To keep it on this version:
+  revert the update in GitHub, then run: stackctl release $stack
+Releasing without reverting will update it to the latest main again
+(taking a fresh backup first).
+EOF
+  if [[ -n $saved ]]; then
+    echo
+    echo "The previous folder is in $saved"
+    echo "Remove it once you're happy with: stackctl clean"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# holds, status, housekeeping
+# ---------------------------------------------------------------------------
+
+cmd_hold() {
+  valid_stack "${1:-}"
+  hold_stack "$1" "${2:-held by hand}"
+  echo "$1 is on hold. Resume with: stackctl release $1"
+}
+
+cmd_release() {
+  valid_stack "${1:-}"
+  if is_held "$1"; then
+    rm -f "$STATE_DIR/holds/$1"
+    echo "Released $1. If main has changed it will update on the next hourly run, or now with: stackctl update"
+  else
+    echo "$1 is not on hold"
+  fi
+}
+
+cmd_status() {
+  local target="" stack dep state note running
+  local -a all
+  if fetch_repo 2> /dev/null; then target="$(target_rev)"; else echo "Warning: could not fetch from GitHub, showing last known state"; target="$(target_rev 2> /dev/null || true)"; fi
+  echo "Repo: $GIT_REMOTE ($BRANCH at ${target:0:7})"
+  echo "Stacks: $STACKS_DIR"
+  echo
+  mapfile -t all < <({ [[ -n $target ]] && stacks_at "$target"; local_stacks; } | sort -u)
+  printf '%-24s %-9s %-8s %-18s %s\n' STACK DEPLOYED RUNNING STATE NOTE
+  for stack in "${all[@]}"; do
+    dep="$(deployed_rev "$stack")"
+    note=""
+    running="-"
+    if has_compose_dir "$stack"; then running="$(dc "$stack" ps -q --status running 2> /dev/null | wc -l)"; fi
+    if is_held "$stack"; then
+      state="ON HOLD"
+      note="$(cat "$STATE_DIR/holds/$stack")"
+    elif [[ -z $dep ]]; then
+      state="not deployed"
+    elif [[ -n $target && $dep != "$target" ]] && ! g diff --quiet "$dep" "$target" -- "$stack" 2> /dev/null; then
+      state="update pending"
+    else
+      state="up to date"
+    fi
+    if [[ -n $target ]] && ! compose_name_at "$target" "$stack" > /dev/null; then note="not in repo ${note}"; fi
+    printf '%-24s %-9s %-8s %-18s %s\n' "$stack" "${dep:0:7}" "$running" "$state" "$note"
+  done
+}
+
+cmd_init() {
+  local export_file="$STATE_DIR/borg-key-export.txt"
+  if borg info > /dev/null 2>&1; then
+    echo "Borg repo already exists and is readable, nothing to create."
+  else
+    log "Creating Borg repo at $BORG_REPO"
+    borg init --encryption=repokey-blake2
+  fi
+  if [[ ! -f $export_file ]]; then
+    (umask 077 && borg key export "$BORG_REPO" "$export_file")
+  fi
+  fetch_repo
+  cat <<EOF
+
+Done. IMPORTANT: copy both of these somewhere safe off this server,
+such as your password manager, then delete the export file:
+
+  Borg key:        $export_file
+  Borg passphrase: the output of: $BORG_PASSCOMMAND
+
+Without both, the backups can't be restored if this server is lost.
+EOF
+}
+
+cmd_adopt() {
+  local target stack changes
+  local -a stacks
+  fetch_repo
+  target="$(target_rev)"
+  mapfile -t stacks < <(stacks_at "$target")
+  for stack in "${stacks[@]}"; do
+    if [[ ! -d "$STACKS_DIR/$stack" ]]; then
+      echo "$stack: not on this server yet, it will be deployed on the next update"
+      continue
+    fi
+    if is_held "$stack"; then
+      echo "$stack: on hold, left alone"
+      continue
+    fi
+    changes="$(local_changes "$stack" "$target")"
+    if [[ -z $changes ]]; then
+      set_deployed "$stack" "$target"
+      echo "$stack: matches ${target:0:7}, marked as deployed"
+    else
+      echo "$stack: differs from the repo in these files, so it will be backed up and updated on the next run:"
+      printf '    %s\n' "${changes//$'\n'/$'\n    '}"
+    fi
+  done
+}
+
+cmd_clean() {
+  if [[ ! -d $TRASH_DIR ]] || [[ -z "$(find "$TRASH_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    echo "Nothing to clean"
+    return 0
+  fi
+  echo "These folders were set aside by past restores:"
+  find "$TRASH_DIR" -mindepth 1 -maxdepth 1 -printf '  %f\n'
+  read -rp "Delete them permanently? [y/N] " answer
+  [[ $answer == [yY] ]] || die "cancelled"
+  in_userns find "$TRASH_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  echo "Cleaned"
+}
+
+# ---------------------------------------------------------------------------
+# test
+# ---------------------------------------------------------------------------
+
+FAILS=0
+check() { # label, command...
+  local label=$1
+  shift
+  if "$@" > /dev/null 2>&1; then
+    printf '  [ OK ] %s\n' "$label"
+  else
+    printf '  [FAIL] %s\n' "$label"
+    FAILS=$((FAILS + 1))
+  fi
+}
+
+borg_version_ok() { [[ "$(borg --version | awk '{print $2}')" =~ ^1\.([2-9]|[1-9][0-9])\. ]]; }
+userns_ok() { [[ "$(in_userns id -u)" == 0 ]]; }
+linger_ok() { [[ "$(loginctl show-user "$(id -un)" -p Linger --value)" == yes ]]; }
+disk_ok() { df -Pk "$STACKS_DIR" | awk 'NR == 2 { exit !($4 > 2097152) }'; }
+ntfy_ok() {
+  [[ -n ${NTFY_URL:-} ]] || return 1
+  local args=(-fsS -m 15 -H "Title: $HOST: stackctl test" -H "Tags: test_tube" -d "Test notification from stackctl test")
+  if [[ -n ${NTFY_TOKEN:-} ]]; then args+=(-H "Authorization: Bearer $NTFY_TOKEN"); fi
+  curl "${args[@]}" "$NTFY_URL"
+}
+
+borg_roundtrip() {
+  local tmp name ok=1
+  tmp="$(mktemp -d)"
+  name="stackctl-selftest@$(date +%s)"
+  echo "stackctl self-test $(date)" > "$tmp/probe.txt"
+  mkdir "$tmp/out"
+  if (cd "$tmp" && in_userns borg create "::$name" probe.txt) \
+    && (cd "$tmp/out" && in_userns borg extract "::$name") \
+    && cmp -s "$tmp/probe.txt" "$tmp/out/probe.txt"; then
+    ok=0
+  fi
+  borg delete "::$name" > /dev/null 2>&1 || true
+  rm -rf "$tmp"
+  return "$ok"
+}
+
+cmd_test() {
+  local notify_test=true t
+  if [[ ${1:-} == --no-notify ]]; then notify_test=false; fi
+
+  echo "stackctl $VERSION self-test on $HOST"
+  echo
+  echo "Tools:"
+  for t in git borg docker nsenter flock curl tar cmp; do check "$t installed" command -v "$t"; done
+  check "Borg is version 1.2 or newer (1.x)" borg_version_ok
+  check "Docker Compose plugin" docker compose version
+  echo
+  echo "Server:"
+  check "Stacks folder exists ($STACKS_DIR)" test -d "$STACKS_DIR"
+  check "At least 2 GB free for the stacks folder" disk_ok
+  check "Rootless Docker is reachable" docker info
+  check "Can enter rootless Docker's user namespace" userns_ok
+  check "Lingering enabled (Docker keeps running when logged out)" linger_ok
+  check "Hourly update timer active" systemctl --user is-active --quiet stackctl-update.timer
+  check "Nightly backup timer active" systemctl --user is-active --quiet stackctl-nightly.timer
+  echo
+  if [[ -n $DATA_DIRS ]]; then
+    echo "Data folders:"
+    for t in $DATA_DIRS; do check "$t is readable inside the user namespace" in_userns test -r "$t"; done
+    echo
+  fi
+  echo "Remote services:"
+  check "GitHub repo readable with the deploy key" fetch_repo
+  check "Borg repo reachable and passphrase correct" borg info
+  check "Borg backup and restore round trip" borg_roundtrip
+  if $notify_test; then check "ntfy notification sent" ntfy_ok; fi
+  echo
+
+  if [[ -n "$(ls -A "$STATE_DIR/holds" 2> /dev/null)" ]]; then
+    echo "Stacks on hold:"
+    for t in "$STATE_DIR"/holds/*; do printf '  %s: %s\n' "${t##*/}" "$(cat "$t")"; done
+    echo
+  fi
+
+  echo "Dry run of the next update:"
+  cmd_update --dry-run 2>&1 | sed 's/^/  /' || true
+  echo
+
+  if (( FAILS > 0 )); then
+    echo "$FAILS check(s) failed."
+    exit 1
+  fi
+  echo "All checks passed."
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd=${1:-help}
+  if (( $# > 0 )); then shift; fi
+
+  case $cmd in
+    help | -h | --help) usage; return 0 ;;
+    version | --version) echo "stackctl $VERSION"; return 0 ;;
+  esac
+
+  load_config
+  case $cmd in
+    update) cmd_update "$@" ;;
+    nightly) cmd_nightly ;;
+    data) cmd_data ;;
+    backup) cmd_backup "$@" ;;
+    list) cmd_list "$@" ;;
+    extract) cmd_extract "$@" ;;
+    restore) cmd_restore "$@" ;;
+    hold) cmd_hold "$@" ;;
+    release) cmd_release "$@" ;;
+    status) cmd_status ;;
+    test) cmd_test "$@" ;;
+    init) cmd_init ;;
+    adopt) cmd_adopt ;;
+    clean) cmd_clean ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up data folders to Borg every night
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

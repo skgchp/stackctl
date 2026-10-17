@@ -1,0 +1,9 @@
+[Unit]
+Description=stackctl: nightly Borg backup of all stacks
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/stackctl nightly
+TimeoutStartSec=6h
+Nice=10
+IOSchedulingClass=idle

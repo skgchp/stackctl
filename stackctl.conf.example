@@ -1,0 +1,47 @@
+# stackctl configuration. Copy to ~/.config/stackctl/stackctl.conf (mode 0600) and edit.
+# The file is sourced by bash, so values must not contain  "  $  `  or a backslash.
+# Override the location with STACKCTL_CONFIG=/path/to/file.
+#
+# This file is the config contract: renaming or removing a key is a breaking change (see AGENTS.md).
+
+# ---- Required ---------------------------------------------------------------
+# Folder holding one sub-folder per stack (each with a compose.yaml).
+STACKS_DIR="/home/dockeruser/stacks"
+
+# Git repo with the stacks, fetched read-only over SSH.
+GIT_REMOTE="git@github.com:YOUR-USER/YOUR-STACKS-REPO.git"
+GITHUB_SSH_KEY="/home/dockeruser/.ssh/github-deploy"   # read-only deploy key; optional
+BRANCH="main"
+
+# Borg repo. For a Hetzner Storage Box sub-account the :23 and the /./ are both required:
+#   ssh://u123456-sub1@u123456.your-storagebox.de:23/./backups/myhost
+BORG_REPO=""
+# Command that prints the repo passphrase. Keep that file mode 0600.
+BORG_PASSCOMMAND="cat /home/dockeruser/.config/stackctl/borg-passphrase"
+
+# ---- Borg over SSH (optional) -----------------------------------------------
+# Borg runs inside rootless Docker's user namespace, where root-owned files (/etc/ssh) appear as
+# "nobody" and ssh looks for known_hosts under /root. So: own -F config file, explicit known_hosts.
+#BORG_RSH="ssh -F /home/dockeruser/.config/stackctl/ssh_config -i /home/dockeruser/.ssh/storagebox -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=/home/dockeruser/.ssh/known_hosts"
+# Remote borg binary, e.g. "borg-1.4" on a Storage Box.
+BORG_REMOTE_PATH=""
+
+# ---- Retention (nightly and pre-update archives, per stack) -----------------
+KEEP_DAILY=3
+KEEP_WEEKLY=3
+KEEP_MONTHLY=3
+KEEP_PRE=3
+
+# ---- Folders outside the stacks, backed up by "stackctl data" ---------------
+# Space-separated absolute paths. Each becomes its own archive series.
+DATA_DIRS=""
+KEEP_DATA_DAILY=7
+KEEP_DATA_WEEKLY=4
+KEEP_DATA_MONTHLY=3
+
+# ---- Notifications (ntfy) ---------------------------------------------------
+# NTFY_URL includes the topic: https://ntfy.example.com/my-topic
+NTFY_URL=""
+NTFY_TOKEN=""
+NOTIFY_SUCCESS=true
+NOTIFY_NIGHTLY_SUCCESS=false

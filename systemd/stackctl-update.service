@@ -1,0 +1,9 @@
+[Unit]
+Description=stackctl: deploy changed stacks from GitHub
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/stackctl update
+TimeoutStartSec=1h
