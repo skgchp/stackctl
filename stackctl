@@ -11,43 +11,31 @@
 
 set -Eeuo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 COMPOSE_NAMES=(compose.yaml compose.yml docker-compose.yaml docker-compose.yml)
 STACK_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 HOST="$(hostname -s)"
 
-# Docker mode decides where config, state and the lock live, so it is settled
-# before the config is read. The environment can choose it; the config file
-# (DOCKER_MODE) can only confirm it.
-MODE="${DOCKER_MODE:-auto}"
-if [[ $MODE == auto ]]; then
-  if (( EUID == 0 )); then MODE=rootful; else MODE=rootless; fi
-fi
-case $MODE in
-  rootful) (( EUID == 0 )) || { echo "stackctl: rootful mode must run as root" >&2; exit 1; } ;;
-  rootless) (( EUID != 0 )) || { echo "stackctl: rootless mode must not run as root; run as the Docker user" >&2; exit 1; } ;;
-  *) echo "stackctl: DOCKER_MODE must be auto, rootless or rootful (got '$MODE')" >&2; exit 1 ;;
-esac
-
-if [[ $MODE == rootful ]]; then
+# Where config, state and timers live follows the user running stackctl, not the Docker mode: a normal
+# user (for example a service account in the docker group) uses its home folder and systemd user timers;
+# root uses /etc, /var/lib and system timers. The Docker mode (rootless or rootful) only decides how
+# files owned by container users are reached; see resolve_mode and as_owner.
+ENV_DOCKER_MODE="${DOCKER_MODE:-}"
+if (( EUID == 0 )); then
   RUNTIME_DIR="/run"
   CONFIG_FILE="${STACKCTL_CONFIG:-/etc/stackctl/stackctl.conf}"
   STATE_DIR="${STACKCTL_STATE_DIR:-/var/lib/stackctl}"
-  LOCK_FILE="$RUNTIME_DIR/stackctl.lock"
 else
   RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
   CONFIG_FILE="${STACKCTL_CONFIG:-${HOME:-/root}/.config/stackctl/stackctl.conf}"
-  STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/stackctl"
-  LOCK_FILE="$RUNTIME_DIR/stackctl.lock"
+  STATE_DIR="${STACKCTL_STATE_DIR:-${XDG_STATE_HOME:-${HOME:-/root}/.local/state}/stackctl}"
 fi
+LOCK_FILE="$RUNTIME_DIR/stackctl.lock"
 GIT_DIR_PATH="$STATE_DIR/repo.git"
 
 # Non-interactive sessions (systemd, cron, SSH) don't load your shell
 # profile, so set up what Docker needs explicitly.
 export PATH="${HOME:-/root}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-if [[ $MODE == rootless ]]; then
-  export DOCKER_HOST="${DOCKER_HOST:-unix://$RUNTIME_DIR/docker.sock}"
-fi
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -97,9 +85,7 @@ load_config() {
   # shellcheck source=/dev/null
   source "$CONFIG_FILE"
 
-  if [[ -n ${DOCKER_MODE:-} && $DOCKER_MODE != auto && $DOCKER_MODE != "$MODE" ]]; then
-    die "DOCKER_MODE=$DOCKER_MODE in $CONFIG_FILE, but stackctl is running in $MODE mode (as $(id -un))"
-  fi
+  resolve_mode
 
   : "${STACKS_DIR:?STACKS_DIR is not set in $CONFIG_FILE}"
   : "${GIT_REMOTE:?GIT_REMOTE is not set in $CONFIG_FILE}"
@@ -118,11 +104,42 @@ load_config() {
   NTFY_URL="${NTFY_URL:-}"
   NTFY_TOKEN="${NTFY_TOKEN:-}"
   TRASH_DIR="$STACKS_DIR/.stackctl-trash"
+  HELPER_IMAGE="${HELPER_IMAGE:-debian:stable-slim}"
+  set_helper_mounts
 
   load_backend_config
   load_git_config
 
   mkdir -p "$STATE_DIR/deployed" "$STATE_DIR/holds" "$STATE_DIR/removed"
+  # A service account without a login session may have no runtime directory.
+  if [[ ! -d $RUNTIME_DIR || ! -w $RUNTIME_DIR ]]; then LOCK_FILE="$STATE_DIR/stackctl.lock"; fi
+}
+
+# Is Docker rootless or rootful? The environment wins, then the config, then a guess: a normal user
+# with its own Docker socket (/run/user/UID/docker.sock) runs rootless Docker, anything else rootful.
+resolve_mode() {
+  MODE="${ENV_DOCKER_MODE:-${DOCKER_MODE:-auto}}"
+  if [[ $MODE == auto ]]; then
+    if (( EUID != 0 )) && [[ -S $RUNTIME_DIR/docker.sock ]]; then MODE=rootless; else MODE=rootful; fi
+  fi
+  case $MODE in
+    rootless) (( EUID != 0 )) || die "rootless Docker runs as a normal user: run stackctl as that user, not root" ;;
+    rootful) ;;
+    *) die "DOCKER_MODE must be auto, rootless or rootful (got '$MODE')" ;;
+  esac
+  if [[ $MODE == rootless ]]; then export DOCKER_HOST="${DOCKER_HOST:-unix://$RUNTIME_DIR/docker.sock}"; fi
+}
+
+# Folders the helper container needs: the stacks, and the parent of each data folder.
+set_helper_mounts() {
+  local d p m found
+  HELPER_MOUNTS=("$STACKS_DIR")
+  for d in $DATA_DIRS; do
+    p="$(dirname "$d")"
+    found=false
+    for m in "${HELPER_MOUNTS[@]}"; do if [[ $m == "$p" ]]; then found=true; fi; done
+    if ! $found; then HELPER_MOUNTS+=("$p"); fi
+  done
 }
 
 # Exactly one backup backend is used. Borg if BORG_REPO is set, otherwise tar
@@ -217,25 +234,45 @@ take_lock() { # seconds to wait, 0 = don't wait
   if [[ $1 == 0 ]]; then flock -n 9; else flock -w "$1" 9; fi
 }
 
-# Run a command as the owner of the stacks' files. Rootless: inside Docker's
-# user namespace, where your user acts as root over files owned by container
-# users (your subordinate UIDs), so backups can read everything and restores
-# keep the right ownership. Rootful: already root, so just run it.
+# Run a command with access to files owned by container users. Three cases:
+#   rootless Docker: inside Docker's user namespace, where your user acts as root over files owned by
+#     container users (your subordinate UIDs), so backups can read everything and restores keep ownership.
+#   rootful Docker, run as root: already enough, so just run it.
+#   rootful Docker, run as a normal user in the docker group: in a throwaway root container that has
+#     the stacks (and data folders) mounted at the same paths. This needs no sudo.
 as_owner() {
-  if [[ $MODE == rootful ]]; then
+  if [[ $MODE == rootless ]]; then
+    local pid
+    pid="$(cat "$RUNTIME_DIR/docker.pid" 2> /dev/null)" || {
+      log "rootless Docker pid file not found at $RUNTIME_DIR/docker.pid"
+      return 1
+    }
+    nsenter -U --preserve-credentials -t "$pid" -- "$@"
+  elif (( EUID == 0 )); then
     "$@"
-    return
+  else
+    helper "$@"
   fi
-  local pid
-  pid="$(cat "$RUNTIME_DIR/docker.pid" 2> /dev/null)" || {
-    log "rootless Docker pid file not found at $RUNTIME_DIR/docker.pid"
-    return 1
-  }
-  nsenter -U --preserve-credentials -t "$pid" -- "$@"
 }
 
-# systemctl for the right manager: the user's in rootless mode, the system's in rootful mode.
-sctl() { if [[ $MODE == rootful ]]; then systemctl "$@"; else systemctl --user "$@"; fi; }
+use_helper() { [[ $MODE == rootful ]] && (( EUID != 0 )); }
+
+# Stdin is only forwarded when the caller sets HELPER_STDIN=1, so a command inside a "while read" loop
+# cannot swallow the loop's input.
+helper() {
+  local d
+  local -a args=(--rm --user 0 --network none --read-only --security-opt no-new-privileges -w "$PWD")
+  if [[ ${HELPER_STDIN:-} == 1 ]]; then args+=(-i); fi
+  for d in "${HELPER_MOUNTS[@]}"; do args+=(-v "$d:$d"); done
+  docker run "${args[@]}" "$HELPER_IMAGE" "$@"
+}
+
+# Writing the files tracked in Git. They must end up owned by whoever runs stackctl, so the root helper
+# container is not used for this.
+as_files() { if use_helper; then "$@"; else as_owner "$@"; fi; }
+
+# systemctl for the right manager: the user's, or the system's when run as root.
+sctl() { if (( EUID == 0 )); then systemctl "$@"; else systemctl --user "$@"; fi; }
 
 dc() { # stack, docker compose args...
   local s=$1
@@ -327,7 +364,7 @@ apply_stack_files() { # stack old target
     done < <(g diff -z --no-renames --name-only --diff-filter=D "$2" "$3" -- "$1")
   fi
   mkdir -p "$STACKS_DIR"
-  g archive --format=tar "$3" "$1" | (cd "$STACKS_DIR" && as_owner tar -x --no-same-owner -f -)
+  g archive --format=tar "$3" "$1" | (cd "$STACKS_DIR" && as_files tar -x --no-same-owner -f -)
 }
 
 # ---------------------------------------------------------------------------
@@ -401,10 +438,31 @@ tar_create() { # archive cwd path profile
   fi
 }
 
+# Borg, with the files read by the helper container: tar streams them into "borg import-tar".
+borg_stream_create() { # archive cwd path profile
+  local compression=zstd,6
+  local -a exclude=(--exclude-caches)
+  if [[ $4 == data ]]; then
+    compression=auto,zstd,3
+    exclude+=(--exclude '*/lost+found')
+  fi
+  (
+    set +e
+    trap - ERR
+    cd "$2" || exit 1
+    as_owner tar -c --numeric-owner "${exclude[@]}" -f - "$3" | borg import-tar --compression "$compression" "::$1" -
+    st=("${PIPESTATUS[@]}")
+    if (( st[0] == 1 )); then log "Warning: some files changed while $3 was being read"; fi
+    (( st[0] <= 1 && st[1] == 0 ))
+  )
+}
+
 bk_create() { # archive cwd path profile (stack|data)
   case $BACKUP_BACKEND in
     borg)
-      if [[ $4 == data ]]; then
+      if use_helper; then
+        borg_stream_create "$@"
+      elif [[ $4 == data ]]; then
         (cd "$2" && as_owner borg create --numeric-ids --exclude-caches \
           --exclude '*/lost+found' --compression auto,zstd,3 "::$1" "$3")
       else
@@ -472,7 +530,9 @@ bk_exists() { # archive
 bk_extract() { # archive dest path mode
   case $BACKUP_BACKEND in
     borg)
-      if [[ $4 == keep ]]; then
+      if [[ $4 == keep ]] && use_helper; then
+        borg export-tar "::$1" - "$3" | (cd "$2" && HELPER_STDIN=1 as_owner tar -x --numeric-owner -f -)
+      elif [[ $4 == keep ]]; then
         (cd "$2" && as_owner borg extract --numeric-ids "::$1" "$3")
       else
         (cd "$2" && borg extract "::$1" "$3")
@@ -482,7 +542,7 @@ bk_extract() { # archive dest path mode
       local f
       f="$(tar_path "$1")" || return 1
       if [[ $4 == keep ]]; then
-        tar_decompress "$f" | (cd "$2" && as_owner tar -x --numeric-owner -f - "$3")
+        tar_decompress "$f" | (cd "$2" && HELPER_STDIN=1 as_owner tar -x --numeric-owner -f - "$3")
       else
         tar_decompress "$f" | (cd "$2" && tar -x --no-same-owner -f - "$3")
       fi
@@ -1088,7 +1148,8 @@ check() { # label, command...
 skip() { printf '  [SKIP] %s\n' "$1"; } # label: not configured, so not a failure
 
 borg_version_ok() { [[ "$(borg --version | awk '{print $2}')" =~ ^1\.([2-9]|[1-9][0-9])\. ]]; }
-userns_ok() { [[ "$(as_owner id -u)" == 0 ]]; }
+# Can stackctl act as root over container-owned files (user namespace, or the helper container)?
+owner_access_ok() { [[ "$(as_owner id -u)" == 0 ]]; }
 linger_ok() { [[ "$(loginctl show-user "$(id -un)" -p Linger --value)" == yes ]]; }
 disk_ok() { df -Pk "$1" | awk 'NR == 2 { exit !($4 > 2097152) }'; }
 
@@ -1107,7 +1168,8 @@ ntfy_ok() {
 
 backup_roundtrip() {
   local tmp name ok=1
-  tmp="$(mktemp -d)"
+  # Inside the stacks folder so the helper container can see it. Dot-folders are not stacks.
+  tmp="$(mktemp -d "$STACKS_DIR/.stackctl-selftest.XXXXXX")"
   name="stackctl-selftest@selftest@$(date +%Y-%m-%dT%H%M%S)@none"
   echo "stackctl self-test $(date)" > "$tmp/probe.txt"
   mkdir "$tmp/out"
@@ -1129,7 +1191,7 @@ cmd_test() {
   if [[ $BACKUP_BACKEND == borg ]]; then tools+=(borg); else tools+=("$TAR_COMPRESSION"); fi
   if [[ -n $NTFY_URL ]]; then tools+=(curl); fi
 
-  echo "stackctl $VERSION self-test on $HOST ($MODE Docker, $BACKUP_BACKEND backups)"
+  echo "stackctl $VERSION self-test on $HOST ($MODE Docker, run as $(id -un), $BACKUP_BACKEND backups)"
   echo
   echo "Tools:"
   for t in "${tools[@]}"; do check "$t installed" command -v "$t"; done
@@ -1142,8 +1204,12 @@ cmd_test() {
   check "Docker is reachable" docker info
   check "Docker is running in $MODE mode" docker_mode_ok
   if [[ $MODE == rootless ]]; then
-    check "Can enter rootless Docker's user namespace" userns_ok
-    check "Lingering enabled (Docker keeps running when logged out)" linger_ok
+    check "Can enter rootless Docker's user namespace" owner_access_ok
+  elif use_helper; then
+    check "Helper container ($HELPER_IMAGE) can act as root on the stacks" owner_access_ok
+  fi
+  if (( EUID != 0 )); then
+    check "Lingering enabled (the timers keep running when logged out)" linger_ok
   fi
   check "Hourly update timer active" sctl is-active --quiet stackctl-update.timer
   check "Nightly backup timer active" sctl is-active --quiet stackctl-nightly.timer

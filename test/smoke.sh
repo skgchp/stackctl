@@ -29,15 +29,22 @@ done
 # Config loading: one backup target is required, and either works.
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-mode=rootless
-if (( EUID == 0 )); then mode=rootful; fi
-export DOCKER_MODE="$mode" STACKCTL_STATE_DIR="$tmp/state" XDG_STATE_HOME="$tmp/state" XDG_RUNTIME_DIR="$tmp/run"
+export STACKCTL_STATE_DIR="$tmp/state" XDG_STATE_HOME="$tmp/state" XDG_RUNTIME_DIR="$tmp/run"
 mkdir -p "$tmp/run"
 printf 'STACKS_DIR="%s/stacks"\nGIT_REMOTE="x"\n' "$tmp" > "$tmp/none.conf"
 if STACKCTL_CONFIG="$tmp/none.conf" ./stackctl list app 2> "$tmp/err"; then fail "config without a backup target loaded"; fi
 grep -q 'no backup target' "$tmp/err" || fail "missing backup target gives the wrong error: $(cat "$tmp/err")"
 printf 'BACKUP_DIR="%s/backups"\n' "$tmp" >> "$tmp/none.conf"
 STACKCTL_CONFIG="$tmp/none.conf" ./stackctl list app > /dev/null 2>&1 || fail "config with BACKUP_DIR did not load"
+
+# The Docker mode follows the environment, then the config, then the user's own Docker socket.
+printf 'DOCKER_MODE="bogus"\n' >> "$tmp/none.conf"
+if STACKCTL_CONFIG="$tmp/none.conf" ./stackctl list app 2> "$tmp/err"; then fail "a bad DOCKER_MODE was accepted"; fi
+grep -q 'DOCKER_MODE must be' "$tmp/err" || fail "bad DOCKER_MODE gives the wrong error: $(cat "$tmp/err")"
+if (( EUID == 0 )); then
+  if DOCKER_MODE=rootless STACKCTL_CONFIG="$tmp/none.conf" ./stackctl list app 2> "$tmp/err"; then fail "rootless mode ran as root"; fi
+  grep -q 'not root' "$tmp/err" || fail "rootless as root gives the wrong error: $(cat "$tmp/err")"
+fi
 
 ./install.sh --help | grep -q 'Usage' || fail "install.sh --help prints nothing useful"
 

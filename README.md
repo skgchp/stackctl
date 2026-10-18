@@ -27,15 +27,17 @@ new files and restarts it. Every night it backs up all your stacks.
 | Linux with systemd, Docker Engine and the `docker compose` plugin | Always |
 | `git`, `ssh`, `flock`, `tar` | Always |
 | A read-only deploy key or access token for your stacks repository | Always |
-| `nsenter` (util-linux), and lingering for the Docker user | Rootless Docker |
+| Lingering for the user (an administrator runs `loginctl enable-linger <user>`) | Normal user |
+| `nsenter` (util-linux) | Rootless Docker |
+| Permission to pull the helper image (`debian:stable-slim`) | Rootful Docker, normal user |
 | `borg` 1.2 or newer (1.x), and a Borg repository | Borg backups |
 | `zstd` (or `gzip` as a fallback) | Tar backups |
 | `curl` | ntfy notifications |
 
 ## Install
 
-Run the installer from a checkout of a release tag. Use the Docker user for rootless Docker, or `sudo` for
-rootful Docker.
+Run the installer from a checkout of a release tag, as the account that will run stackctl: a service account
+that can use Docker (rootless Docker, or a member of the `docker` group), or root.
 
 ```bash
 git clone --branch vX.Y.Z <url-of-this-repo>
@@ -56,21 +58,30 @@ whether you want ntfy. It then:
 After pulling a new release, run `./install.sh --upgrade` to replace only the script and the units.
 The [guide](docs/GUIDE.md) explains each step and how to do the install by hand.
 
-### Rootless or rootful
+### Which account, and which Docker
 
-stackctl picks rootful when run as root, and rootless otherwise. Set `DOCKER_MODE` to force one.
+Where stackctl keeps things depends on the account that runs it. A normal user, such as a service account,
+needs no root folders.
 
-| | Rootless Docker | Rootful Docker |
+| | Normal user | Root |
 |---|---|---|
-| Runs as | the Docker user | root |
 | Config | `~/.config/stackctl/stackctl.conf` | `/etc/stackctl/stackctl.conf` |
 | State | `~/.local/state/stackctl/` | `/var/lib/stackctl/` |
-| Systemd units | `~/.config/systemd/user/` | `/etc/systemd/system/` |
-| Systemd commands | `systemctl --user` | `systemctl` |
-| Extra needs | lingering, `nsenter` | none |
+| Systemd units | `~/.config/systemd/user/`, with `systemctl --user` | `/etc/systemd/system/` |
+| Extra needs | lingering, so the timers run while logged out | none |
 
-The script is always installed at `/usr/local/bin/stackctl`, owned by root, so the user whose timers run it
-cannot change it.
+Whether Docker is rootless or rootful only changes how stackctl reaches files that containers created as other
+users, such as database data. stackctl detects it: a user with their own Docker socket is rootless, anything
+else is rootful. Set `DOCKER_MODE` to force one.
+
+| Docker | Run as | Container-owned files are reached |
+|---|---|---|
+| Rootless | the Docker user | through Docker's user namespace (`nsenter`) |
+| Rootful | a user in the `docker` group | through a short-lived root container (`HELPER_IMAGE`), with no sudo |
+| Rootful | root | directly |
+
+The script is installed at `/usr/local/bin/stackctl`, owned by root, so the user whose timers run it cannot
+change it. Without sudo, the installer offers `~/.local/bin/stackctl` instead.
 
 ## Commands
 
