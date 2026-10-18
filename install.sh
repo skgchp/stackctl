@@ -275,17 +275,27 @@ make_key() { # path comment
 
 # pin_host_key HOST PORT FILE: record the server's host keys after you confirm the fingerprints.
 pin_host_key() {
-  local keys
+  local keys tmp
   if [[ $1 == github.com ]]; then
     install -m 0644 "$HERE/github_known_hosts" "$3"
     say "Using GitHub's published host keys."
     return 0
   fi
-  keys="$(ssh-keyscan -p "$2" -t ed25519,ecdsa,rsa "$1" 2> /dev/null || true)"
-  [[ -n $keys ]] || die "Could not read host keys from $1:$2. Is the host and port right, and reachable from here?"
+  # Comment lines (the server banner) are dropped, so only real keys count.
+  keys="$(ssh-keyscan -T 10 -p "$2" "$1" 2> /dev/null | grep -v '^#' || true)"
+  if [[ -z $keys ]]; then
+    die "ssh-keyscan found no host keys at $1:$2. Check the host and port, that this machine can reach it, and run: ssh-keyscan -p $2 $1"
+  fi
+  # ssh-keygen needs a real file here, not a pipe.
+  tmp="$(mktemp)"
+  printf '%s\n' "$keys" > "$tmp"
   say "Host keys offered by $1:$2:"
-  ssh-keygen -lf /dev/stdin <<< "$keys" | sed 's/^/  /'
-  say "Compare these with the server's own list (the Git server's admin page, or Hetzner's published fingerprints)."
+  if ! ssh-keygen -lf "$tmp" | sed 's/^/  /'; then
+    rm -f "$tmp"
+    die "Could not read the host keys that $1:$2 returned. Run: ssh-keyscan -p $2 $1"
+  fi
+  rm -f "$tmp"
+  say "Compare these with the server's own list (the Git server's admin page, or your provider's published fingerprints)."
   ask_yn "Do they match?" n || die "Host key not confirmed, nothing was trusted."
   (umask 022 && printf '%s\n' "$keys" > "$3")
 }
@@ -473,6 +483,9 @@ EOT
 }
 
 configure() {
+  # The keys, token and passphrase below are written into this folder before the config file is.
+  mkdir -p "$CONF_DIR"
+  chmod 700 "$CONF_DIR"
   ask_required STACKS_DIR "Folder for your stacks" "$DEFAULT_STACKS"
   mkdir -p "$STACKS_DIR"
   configure_git
