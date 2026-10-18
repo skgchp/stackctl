@@ -1,5 +1,5 @@
 [Unit]
-Description=Nightly Borg backup of all stacks
+Description=Nightly backup of all stacks
 
 [Timer]
 OnCalendar=*-*-* 03:30:00

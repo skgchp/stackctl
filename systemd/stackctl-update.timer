@@ -1,5 +1,5 @@
 [Unit]
-Description=Check GitHub for stack changes every hour
+Description=Check Git for stack changes every hour
 
 [Timer]
 OnCalendar=hourly
