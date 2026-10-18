@@ -63,6 +63,9 @@ Keep it shellcheck-clean:
 in a container, for example
 `docker run --rm -v "$PWD":/w:ro -w /w debian:stable bash -c 'apt-get -qq update && apt-get -qq install -y zstd git shellcheck && ./test/smoke.sh && ./test/tar.sh'`.
 
+CI (`.github/workflows/ci.yml`) runs both on every pull request, plus a Trivy scan for known vulnerabilities and
+leaked secrets. Dependabot keeps the pinned action versions current.
+
 They **cannot** prove rootful or rootless Docker, Borg over SSH, `nsenter`, lingering, the Git hosts or the
 timers. Say so when you rely on them. Those are proven with `stackctl test` on a scratch server, and by a
 real update, restore and `extract` round trip, for each mode and backend you touched.
