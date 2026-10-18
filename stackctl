@@ -1,30 +1,53 @@
 #!/usr/bin/env bash
 #
-# stackctl: pull-based deploys with Borg backups for Docker Compose stacks.
+# stackctl: pull-based deploys with backups for Docker Compose stacks.
 #
-# Watches the main branch of a GitHub repo. When a stack's folder changes it
-# backs the stack up to Borg (stopped, so the backup is consistent), writes
-# out the new files, then runs docker compose pull and up -d.
+# Watches a branch of a Git repo (GitHub, GitLab, Forgejo, Gitea, ...). When a
+# stack's folder changes it backs the stack up to Borg or to tar files (stopped,
+# so the backup is consistent), writes out the new files, then runs docker
+# compose pull and up -d. Works with rootless and rootful Docker.
 #
 # Run "stackctl help" for the list of commands.
 
 set -Eeuo pipefail
 
-VERSION="1.0.0"
-CONFIG_FILE="${STACKCTL_CONFIG:-$HOME/.config/stackctl/stackctl.conf}"
+VERSION="2.0.0"
 COMPOSE_NAMES=(compose.yaml compose.yml docker-compose.yaml docker-compose.yml)
 STACK_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
-
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/stackctl"
-GIT_DIR_PATH="$STATE_DIR/repo.git"
-LOCK_FILE="$RUNTIME_DIR/stackctl.lock"
 HOST="$(hostname -s)"
 
+# Docker mode decides where config, state and the lock live, so it is settled
+# before the config is read. The environment can choose it; the config file
+# (DOCKER_MODE) can only confirm it.
+MODE="${DOCKER_MODE:-auto}"
+if [[ $MODE == auto ]]; then
+  if (( EUID == 0 )); then MODE=rootful; else MODE=rootless; fi
+fi
+case $MODE in
+  rootful) (( EUID == 0 )) || { echo "stackctl: rootful mode must run as root" >&2; exit 1; } ;;
+  rootless) (( EUID != 0 )) || { echo "stackctl: rootless mode must not run as root; run as the Docker user" >&2; exit 1; } ;;
+  *) echo "stackctl: DOCKER_MODE must be auto, rootless or rootful (got '$MODE')" >&2; exit 1 ;;
+esac
+
+if [[ $MODE == rootful ]]; then
+  RUNTIME_DIR="/run"
+  CONFIG_FILE="${STACKCTL_CONFIG:-/etc/stackctl/stackctl.conf}"
+  STATE_DIR="${STACKCTL_STATE_DIR:-/var/lib/stackctl}"
+  LOCK_FILE="$RUNTIME_DIR/stackctl.lock"
+else
+  RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  CONFIG_FILE="${STACKCTL_CONFIG:-${HOME:-/root}/.config/stackctl/stackctl.conf}"
+  STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/stackctl"
+  LOCK_FILE="$RUNTIME_DIR/stackctl.lock"
+fi
+GIT_DIR_PATH="$STATE_DIR/repo.git"
+
 # Non-interactive sessions (systemd, cron, SSH) don't load your shell
-# profile, so set up what rootless Docker needs explicitly.
-export PATH="$HOME/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export DOCKER_HOST="${DOCKER_HOST:-unix://$RUNTIME_DIR/docker.sock}"
+# profile, so set up what Docker needs explicitly.
+export PATH="${HOME:-/root}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if [[ $MODE == rootless ]]; then
+  export DOCKER_HOST="${DOCKER_HOST:-unix://$RUNTIME_DIR/docker.sock}"
+fi
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,13 +58,13 @@ die() { log "ERROR: $*"; exit 1; }
 
 usage() {
   cat <<'EOF'
-stackctl: pull-based deploys with Borg backups for Docker Compose stacks
+stackctl: pull-based deploys with backups for Docker Compose stacks
 
 Everyday commands:
-  test [--no-notify]          Check everything works, including a Borg backup
+  test [--no-notify]          Check everything works, including a backup
                               and restore round trip, then show a dry run
   status                      Show each stack's deployed version and state
-  update [--dry-run]          Deploy changes from GitHub (run hourly by systemd)
+  update [--dry-run]          Deploy changes from Git (run hourly by systemd)
 
 Backups:
   list <stack>                List a stack's backups
@@ -60,7 +83,8 @@ Holds:
   release <stack>             Resume automatic updates for a stack
 
 Setup and housekeeping:
-  init                        Create the Borg repo and export its key (first run)
+  init                        Set up the backup target: create the Borg repo and export its
+                              key, or the tar backup folder (first run)
   adopt                       Mark stacks already running as deployed, without
                               restarting them (first run on an existing server)
   clean                       Delete folders set aside by past restores
@@ -73,10 +97,12 @@ load_config() {
   # shellcheck source=/dev/null
   source "$CONFIG_FILE"
 
+  if [[ -n ${DOCKER_MODE:-} && $DOCKER_MODE != auto && $DOCKER_MODE != "$MODE" ]]; then
+    die "DOCKER_MODE=$DOCKER_MODE in $CONFIG_FILE, but stackctl is running in $MODE mode (as $(id -un))"
+  fi
+
   : "${STACKS_DIR:?STACKS_DIR is not set in $CONFIG_FILE}"
   : "${GIT_REMOTE:?GIT_REMOTE is not set in $CONFIG_FILE}"
-  : "${BORG_REPO:?BORG_REPO is not set in $CONFIG_FILE}"
-  : "${BORG_PASSCOMMAND:?BORG_PASSCOMMAND is not set in $CONFIG_FILE}"
 
   BRANCH="${BRANCH:-main}"
   KEEP_DAILY="${KEEP_DAILY:-3}"
@@ -89,18 +115,81 @@ load_config() {
   KEEP_DATA_MONTHLY="${KEEP_DATA_MONTHLY:-3}"
   NOTIFY_SUCCESS="${NOTIFY_SUCCESS:-true}"
   NOTIFY_NIGHTLY_SUCCESS="${NOTIFY_NIGHTLY_SUCCESS:-false}"
+  NTFY_URL="${NTFY_URL:-}"
+  NTFY_TOKEN="${NTFY_TOKEN:-}"
   TRASH_DIR="$STACKS_DIR/.stackctl-trash"
 
-  export BORG_REPO BORG_PASSCOMMAND
-  if [[ -n ${BORG_RSH:-} ]]; then export BORG_RSH; fi
-  if [[ -n ${BORG_REMOTE_PATH:-} ]]; then export BORG_REMOTE_PATH; fi
-  if [[ -n ${GITHUB_SSH_KEY:-} ]]; then
-    local key_q
-    key_q="$(printf '%q' "$GITHUB_SSH_KEY")"
-    export GIT_SSH_COMMAND="ssh -i $key_q -o IdentitiesOnly=yes -o BatchMode=yes"
-  fi
+  load_backend_config
+  load_git_config
 
   mkdir -p "$STATE_DIR/deployed" "$STATE_DIR/holds" "$STATE_DIR/removed"
+}
+
+# Exactly one backup backend is used. Borg if BORG_REPO is set, otherwise tar
+# files in BACKUP_DIR, unless BACKUP_BACKEND says otherwise.
+load_backend_config() {
+  BORG_REPO="${BORG_REPO:-}"
+  BACKUP_DIR="${BACKUP_DIR:-}"
+  BACKUP_BACKEND="${BACKUP_BACKEND:-auto}"
+  TAR_COMPRESSION="${TAR_COMPRESSION:-zstd}"
+
+  if [[ $BACKUP_BACKEND == auto ]]; then
+    if [[ -n $BORG_REPO ]]; then
+      BACKUP_BACKEND=borg
+    elif [[ -n $BACKUP_DIR ]]; then
+      BACKUP_BACKEND=tar
+    else
+      die "no backup target: set BORG_REPO (Borg) or BACKUP_DIR (tar files) in $CONFIG_FILE"
+    fi
+  fi
+
+  case $BACKUP_BACKEND in
+    borg)
+      : "${BORG_REPO:?BORG_REPO is not set in $CONFIG_FILE}"
+      : "${BORG_PASSCOMMAND:?BORG_PASSCOMMAND is not set in $CONFIG_FILE}"
+      export BORG_REPO BORG_PASSCOMMAND
+      if [[ -n ${BORG_RSH:-} ]]; then export BORG_RSH; fi
+      if [[ -n ${BORG_REMOTE_PATH:-} ]]; then export BORG_REMOTE_PATH; fi
+      ;;
+    tar)
+      : "${BACKUP_DIR:?BACKUP_DIR is not set in $CONFIG_FILE}"
+      [[ $BACKUP_DIR == /* ]] || die "BACKUP_DIR must be an absolute path"
+      case $TAR_COMPRESSION in
+        zstd) command -v zstd > /dev/null || TAR_COMPRESSION=gzip ;;
+        gzip) ;;
+        *) die "TAR_COMPRESSION must be zstd or gzip (got '$TAR_COMPRESSION')" ;;
+      esac
+      ;;
+    *) die "BACKUP_BACKEND must be auto, borg or tar (got '$BACKUP_BACKEND')" ;;
+  esac
+}
+
+# SSH deploy key (any host and port) or an HTTPS token kept in a file.
+# GITHUB_SSH_KEY is the old name of GIT_SSH_KEY.
+load_git_config() {
+  GIT_SSH_KEY="${GIT_SSH_KEY:-${GITHUB_SSH_KEY:-}}"
+  GIT_KNOWN_HOSTS="${GIT_KNOWN_HOSTS:-}"
+  GIT_TOKEN_FILE="${GIT_TOKEN_FILE:-}"
+  GIT_USERNAME="${GIT_USERNAME:-oauth2}"
+  GIT_AUTH_ARGS=()
+
+  if [[ -n $GIT_SSH_KEY || -n $GIT_KNOWN_HOSTS ]]; then
+    local cmd="ssh -o BatchMode=yes"
+    if [[ -n $GIT_SSH_KEY ]]; then cmd+=" -i $(printf '%q' "$GIT_SSH_KEY") -o IdentitiesOnly=yes"; fi
+    if [[ -n $GIT_KNOWN_HOSTS ]]; then
+      cmd+=" -o UserKnownHostsFile=$(printf '%q' "$GIT_KNOWN_HOSTS") -o StrictHostKeyChecking=yes"
+    fi
+    export GIT_SSH_COMMAND="$cmd"
+  fi
+
+  if [[ -n $GIT_TOKEN_FILE ]]; then
+    [[ -r $GIT_TOKEN_FILE ]] || die "GIT_TOKEN_FILE is not readable: $GIT_TOKEN_FILE"
+    [[ $GIT_USERNAME =~ ^[A-Za-z0-9._@-]+$ ]] || die "GIT_USERNAME has unexpected characters"
+    # The helper reads the token from the file itself, so it is never in argv, the environment or the logs.
+    GIT_AUTH_ARGS=(-c credential.helper=
+      -c "credential.helper=!f() { echo username=$GIT_USERNAME; printf 'password=%s\\n' \"\$(cat $(printf '%q' "$GIT_TOKEN_FILE"))\"; }; f")
+    export GIT_TERMINAL_PROMPT=0
+  fi
 }
 
 short_or() { if [[ -n ${1:-} ]]; then printf '%s' "${1:0:7}"; else printf '%s' "$2"; fi; }
@@ -128,10 +217,15 @@ take_lock() { # seconds to wait, 0 = don't wait
   if [[ $1 == 0 ]]; then flock -n 9; else flock -w "$1" 9; fi
 }
 
-# Run a command inside rootless Docker's user namespace. There, your user
-# acts as root over files owned by container users (your subordinate UIDs),
-# so backups can read everything and restores keep the right ownership.
-in_userns() {
+# Run a command as the owner of the stacks' files. Rootless: inside Docker's
+# user namespace, where your user acts as root over files owned by container
+# users (your subordinate UIDs), so backups can read everything and restores
+# keep the right ownership. Rootful: already root, so just run it.
+as_owner() {
+  if [[ $MODE == rootful ]]; then
+    "$@"
+    return
+  fi
   local pid
   pid="$(cat "$RUNTIME_DIR/docker.pid" 2> /dev/null)" || {
     log "rootless Docker pid file not found at $RUNTIME_DIR/docker.pid"
@@ -139,6 +233,9 @@ in_userns() {
   }
   nsenter -U --preserve-credentials -t "$pid" -- "$@"
 }
+
+# systemctl for the right manager: the user's in rootless mode, the system's in rootful mode.
+sctl() { if [[ $MODE == rootful ]]; then systemctl "$@"; else systemctl --user "$@"; fi; }
 
 dc() { # stack, docker compose args...
   local s=$1
@@ -150,7 +247,7 @@ dc() { # stack, docker compose args...
 # Git
 # ---------------------------------------------------------------------------
 
-g() { git --git-dir="$GIT_DIR_PATH" "$@"; }
+g() { git --git-dir="$GIT_DIR_PATH" ${GIT_AUTH_ARGS[@]+"${GIT_AUTH_ARGS[@]}"} "$@"; }
 
 fetch_repo() {
   if [[ ! -d $GIT_DIR_PATH ]]; then git init -q --bare "$GIT_DIR_PATH"; fi
@@ -199,7 +296,7 @@ local_stacks() {
   done
 }
 
-read_file() { if [[ -r $1 ]]; then cat -- "$1"; else in_userns cat -- "$1"; fi; }
+read_file() { if [[ -r $1 ]]; then cat -- "$1"; else as_owner cat -- "$1"; fi; }
 
 # Print tracked files in a stack whose contents differ from the given revision.
 local_changes() { # stack rev
@@ -226,11 +323,11 @@ apply_stack_files() { # stack old target
   local f
   if [[ -n $2 ]]; then
     while IFS= read -r -d '' f; do
-      in_userns rm -f -- "$STACKS_DIR/$f" || return 1
+      as_owner rm -f -- "$STACKS_DIR/$f" || return 1
     done < <(g diff -z --no-renames --name-only --diff-filter=D "$2" "$3" -- "$1")
   fi
   mkdir -p "$STACKS_DIR"
-  g archive --format=tar "$3" "$1" | (cd "$STACKS_DIR" && in_userns tar -x --no-same-owner -f -)
+  g archive --format=tar "$3" "$1" | (cd "$STACKS_DIR" && as_owner tar -x --no-same-owner -f -)
 }
 
 # ---------------------------------------------------------------------------
@@ -243,27 +340,292 @@ is_held() { [[ -f "$STATE_DIR/holds/$1" ]]; }
 hold_stack() { printf '%s %s\n' "$(date '+%F %T')" "$2" > "$STATE_DIR/holds/$1"; }
 
 # ---------------------------------------------------------------------------
-# Borg
+# Backups
+#
+# Everything that touches backup storage goes through the bk_* functions, which
+# dispatch on BACKUP_BACKEND (borg or tar). An archive is named
+# <series>@<kind>@<time>@<rev>, where the series is a stack or data folder name.
 # ---------------------------------------------------------------------------
+
+tar_ext() { if [[ $TAR_COMPRESSION == zstd ]]; then printf .tar.zst; else printf .tar.gz; fi; }
+
+# Path of an existing tar archive, whichever compression it was written with.
+tar_path() { # archive
+  local e
+  for e in .tar.zst .tar.gz; do
+    if [[ -f "$BACKUP_DIR/${1%%@*}/$1$e" ]]; then
+      printf '%s' "$BACKUP_DIR/${1%%@*}/$1$e"
+      return 0
+    fi
+  done
+  return 1
+}
+
+tar_decompress() { # file
+  case $1 in
+    *.zst) zstd -dc -q -- "$1" ;;
+    *) gzip -dc -- "$1" ;;
+  esac
+}
+
+# Write a compressed tar of <path> (relative to <cwd>) to a .partial file and
+# rename it when complete, so an interrupted backup is never mistaken for one.
+# tar exits 1 when a file changed while it was read, which is expected for a
+# stack that is still running; that is a warning, not a failure.
+tar_create() { # archive cwd path profile
+  local dir="$BACKUP_DIR/${1%%@*}" final tmp
+  local -a exclude=(--exclude-caches)
+  final="$dir/$1$(tar_ext)"
+  tmp="$final.partial"
+  if [[ $4 == data ]]; then exclude+=(--exclude '*/lost+found'); fi
+  (umask 077 && mkdir -p "$dir") || return 1
+
+  if (
+    set +e
+    trap - ERR
+    umask 077
+    cd "$2" || exit 1
+    if [[ $TAR_COMPRESSION == zstd ]]; then
+      as_owner tar -c --numeric-owner "${exclude[@]}" -f - "$3" | zstd -q -T0 -6 > "$tmp"
+    else
+      as_owner tar -c --numeric-owner "${exclude[@]}" -f - "$3" | gzip -6 > "$tmp"
+    fi
+    st=("${PIPESTATUS[@]}")
+    if (( st[0] == 1 )); then log "Warning: some files changed while $3 was being read"; fi
+    (( st[0] <= 1 && st[1] == 0 ))
+  ); then
+    mv -- "$tmp" "$final"
+  else
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+bk_create() { # archive cwd path profile (stack|data)
+  case $BACKUP_BACKEND in
+    borg)
+      if [[ $4 == data ]]; then
+        (cd "$2" && as_owner borg create --numeric-ids --exclude-caches \
+          --exclude '*/lost+found' --compression auto,zstd,3 "::$1" "$3")
+      else
+        (cd "$2" && as_owner borg create --numeric-ids --exclude-caches \
+          --compression zstd,6 "::$1" "$3")
+      fi
+      ;;
+    tar) tar_create "$@" ;;
+  esac
+}
+
+# Archive names of a series, oldest first.
+bk_names() { # series
+  case $BACKUP_BACKEND in
+    borg) borg list --short --sort-by timestamp --glob-archives "$1@*" ;;
+    tar)
+      local f
+      for f in "$BACKUP_DIR/$1"/*.tar.zst "$BACKUP_DIR/$1"/*.tar.gz; do
+        [[ -f $f ]] || continue
+        f=${f##*/}
+        printf '%s\n' "${f%.tar.*}"
+      done | LC_ALL=C sort -t@ -k3,3
+      ;;
+  esac
+}
+
+# Every series that has backups.
+bk_series() {
+  case $BACKUP_BACKEND in
+    borg) borg list --short | cut -d@ -f1 | sort -u | grep -E "$STACK_RE" || true ;;
+    tar)
+      local d
+      for d in "$BACKUP_DIR"/*/; do
+        [[ -d $d ]] || continue
+        d=${d%/}
+        d=${d##*/}
+        if [[ $d =~ $STACK_RE ]]; then printf '%s\n' "$d"; fi
+      done
+      ;;
+  esac
+}
+
+# Print archive names with the time they were made (for "stackctl list").
+bk_list() { # series
+  case $BACKUP_BACKEND in
+    borg) borg list --glob-archives "$1@*" --sort-by timestamp --format '{archive:<70} {time}{NL}' ;;
+    tar)
+      local n f
+      while IFS= read -r n; do
+        f="$(tar_path "$n")" || continue
+        printf '%-70s %s\n' "$n" "$(date -r "$f" '+%a, %Y-%m-%d %H:%M:%S')"
+      done < <(bk_names "$1")
+      ;;
+  esac
+}
+
+bk_exists() { # archive
+  case $BACKUP_BACKEND in
+    borg) borg info "::$1" > /dev/null ;;
+    tar) tar_path "$1" > /dev/null ;;
+  esac
+}
+
+# mode: keep = restore ownership (as the stacks' owner), noown = files owned by the caller
+bk_extract() { # archive dest path mode
+  case $BACKUP_BACKEND in
+    borg)
+      if [[ $4 == keep ]]; then
+        (cd "$2" && as_owner borg extract --numeric-ids "::$1" "$3")
+      else
+        (cd "$2" && borg extract "::$1" "$3")
+      fi
+      ;;
+    tar)
+      local f
+      f="$(tar_path "$1")" || return 1
+      if [[ $4 == keep ]]; then
+        tar_decompress "$f" | (cd "$2" && as_owner tar -x --numeric-owner -f - "$3")
+      else
+        tar_decompress "$f" | (cd "$2" && tar -x --no-same-owner -f - "$3")
+      fi
+      ;;
+  esac
+}
+
+bk_delete() { # archive
+  case $BACKUP_BACKEND in
+    borg) borg delete "::$1" ;;
+    tar) rm -f -- "$(tar_path "$1")" ;;
+  esac
+}
+
+bk_delete_hint() { # how to delete a manual backup by hand
+  case $BACKUP_BACKEND in
+    borg) printf 'borg delete ::<archive>' ;;
+    tar) printf 'rm %s/<stack>/<archive>.tar.*' "$BACKUP_DIR" ;;
+  esac
+}
+
+bk_compact() { if [[ $BACKUP_BACKEND == borg ]]; then borg compact; fi; }
+
+# Reads archive names, newest first, on stdin and prints those to keep: the
+# newest archive of each of the last N days, ISO weeks and months that have
+# one. This is how "borg prune --keep-daily/weekly/monthly" counts too.
+retention_keep() { # daily weekly monthly
+  local -A seen_d=() seen_w=() seen_m=() keep=()
+  local nd=0 nw=0 nm=0 name t day week month
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    IFS=@ read -r _ _ t _ <<< "$name"
+    day=${t%%T*}
+    week="$(date -d "$day" +%G-W%V)"
+    month=${day:0:7}
+    if (( nd < $1 )) && [[ -z ${seen_d[$day]:-} ]]; then seen_d[$day]=1; nd=$((nd + 1)); keep[$name]=1; fi
+    if (( nw < $2 )) && [[ -z ${seen_w[$week]:-} ]]; then seen_w[$week]=1; nw=$((nw + 1)); keep[$name]=1; fi
+    if (( nm < $3 )) && [[ -z ${seen_m[$month]:-} ]]; then seen_m[$month]=1; nm=$((nm + 1)); keep[$name]=1; fi
+  done
+  for name in "${!keep[@]}"; do printf '%s\n' "$name"; done
+}
+
+# Keep the newest daily/weekly/monthly archives of <series>@<kind>@*, delete the rest.
+bk_prune() { # series kind daily weekly monthly
+  case $BACKUP_BACKEND in
+    borg)
+      borg prune --glob-archives "$1@$2@*" --keep-daily "$3" --keep-weekly "$4" --keep-monthly "$5"
+      ;;
+    tar)
+      local name failed=0 kept
+      local -a all=()
+      mapfile -t all < <(bk_names "$1" | grep -F -- "$1@$2@" | tac || true)
+      kept="$(printf '%s\n' "${all[@]}" | retention_keep "$3" "$4" "$5")"
+      for name in "${all[@]}"; do
+        [[ -n $name ]] || continue
+        if ! grep -qxF -- "$name" <<< "$kept"; then
+          log "Pruning $name"
+          bk_delete "$name" || failed=1
+        fi
+      done
+      return "$failed"
+      ;;
+  esac
+}
+
+# Keep only the newest <n> archives of <series>@<kind>@*.
+bk_prune_last() { # series kind n
+  case $BACKUP_BACKEND in
+    borg) borg prune --glob-archives "$1@$2@*" --keep-last "$3" ;;
+    tar)
+      local name failed=0
+      while IFS= read -r name; do
+        [[ -n $name ]] || continue
+        log "Pruning $name"
+        bk_delete "$name" || failed=1
+      done < <(bk_names "$1" | grep -F -- "$1@$2@" | tac | tail -n +"$(($3 + 1))" || true)
+      return "$failed"
+      ;;
+  esac
+}
+
+# First-run setup of the backup target.
+bk_init() {
+  case $BACKUP_BACKEND in
+    borg)
+      local export_file="$STATE_DIR/borg-key-export.txt"
+      if borg info > /dev/null 2>&1; then
+        echo "Borg repo already exists and is readable, nothing to create."
+      else
+        log "Creating Borg repo at $BORG_REPO"
+        borg init --encryption=repokey-blake2
+      fi
+      if [[ ! -f $export_file ]]; then
+        (umask 077 && borg key export "$BORG_REPO" "$export_file")
+      fi
+      cat <<EOT
+
+Done. IMPORTANT: copy both of these somewhere safe off this server,
+such as your password manager, then delete the export file:
+
+  Borg key:        $export_file
+  Borg passphrase: the output of: $BORG_PASSCOMMAND
+
+Without both, the backups can't be restored if this server is lost.
+EOT
+      ;;
+    tar)
+      (umask 077 && mkdir -p "$BACKUP_DIR")
+      [[ -w $BACKUP_DIR ]] || die "$BACKUP_DIR is not writable"
+      cat <<EOT
+
+Done. Backups will be written to $BACKUP_DIR as $TAR_COMPRESSION tar files.
+They are not encrypted, and they stay on this machine unless $BACKUP_DIR is
+a separate disk or mount: copy them off the server too (rsync, a NAS, ...).
+EOT
+      ;;
+  esac
+}
+
+# Is the backup target reachable and usable?
+bk_info() {
+  case $BACKUP_BACKEND in
+    borg) borg info ;;
+    tar) [[ -d $BACKUP_DIR && -w $BACKUP_DIR ]] ;;
+  esac
+}
 
 backup_stack() { # stack kind rev
   local name
   name="$1@$2@$(date +%Y-%m-%dT%H%M%S)@${3:0:7}"
   log "Backing up $1 to archive $name"
-  (cd "$STACKS_DIR" && in_userns borg create --numeric-ids --exclude-caches \
-    --compression zstd,6 "::$name" "$1")
+  bk_create "$name" "$STACKS_DIR" "$1" stack
 }
 
 prune_all() {
   local stack failed=0
   local -a stacks
-  mapfile -t stacks < <(borg list --short | cut -d@ -f1 | sort -u | grep -E "$STACK_RE" || true)
+  mapfile -t stacks < <(bk_series)
   for stack in "${stacks[@]}"; do
-    borg prune --glob-archives "$stack@nightly@*" --keep-daily "$KEEP_DAILY" \
-      --keep-weekly "$KEEP_WEEKLY" --keep-monthly "$KEEP_MONTHLY" || failed=1
-    borg prune --glob-archives "$stack@pre@*" --keep-last "$KEEP_PRE" || failed=1
+    bk_prune "$stack" nightly "$KEEP_DAILY" "$KEEP_WEEKLY" "$KEEP_MONTHLY" || failed=1
+    bk_prune_last "$stack" pre "$KEEP_PRE" || failed=1
   done
-  borg compact || failed=1
+  bk_compact || failed=1
   return "$failed"
 }
 
@@ -279,15 +641,13 @@ backup_data() { # absolute folder
   }
   archive="$name@data@$(date +%Y-%m-%dT%H%M%S)@none"
   log "Backing up $1 to archive $archive"
-  (cd "$(dirname "$1")" && in_userns borg create --numeric-ids --exclude-caches \
-    --exclude '*/lost+found' --compression auto,zstd,3 "::$archive" "$name")
+  bk_create "$archive" "$(dirname "$1")" "$name" data
 }
 
 prune_data() { # absolute folder
   local name
   name="$(basename "$1")"
-  borg prune --glob-archives "$name@data@*" --keep-daily "$KEEP_DATA_DAILY" \
-    --keep-weekly "$KEEP_DATA_WEEKLY" --keep-monthly "$KEEP_DATA_MONTHLY"
+  bk_prune "$name" data "$KEEP_DATA_DAILY" "$KEEP_DATA_WEEKLY" "$KEEP_DATA_MONTHLY"
 }
 
 # ---------------------------------------------------------------------------
@@ -308,7 +668,7 @@ deploy_stack() { # stack old target
     changes="$(local_changes "$stack" "$old")"
     if [[ -n $changes ]]; then
       hold_stack "$stack" "local changes to tracked files"
-      printf -v msg 'These tracked files were changed on the server, so the update was skipped and %s is on hold:\n%s\n\nCommit the changes to GitHub or undo them, then run: stackctl release %s' \
+      printf -v msg 'These tracked files were changed on the server, so the update was skipped and %s is on hold:\n%s\n\nCommit the changes to Git or undo them, then run: stackctl release %s' \
         "$stack" "$changes" "$stack"
       notify high "$stack not updated" "$msg"
       return 1
@@ -366,13 +726,13 @@ cmd_update() {
   if ! fetch_repo; then
     if ! $dry && [[ ! -f $STATE_DIR/fetch-failing ]]; then
       touch "$STATE_DIR/fetch-failing"
-      notify high "Cannot reach GitHub" "Could not fetch $GIT_REMOTE. Updates are paused until it works again; you'll get one more notification when it recovers."
+      notify high "Cannot reach Git server" "Could not fetch $GIT_REMOTE. Updates are paused until it works again; you'll get one more notification when it recovers."
     fi
     die "could not fetch $GIT_REMOTE"
   fi
   if ! $dry && [[ -f $STATE_DIR/fetch-failing ]]; then
     rm -f "$STATE_DIR/fetch-failing"
-    notify default "GitHub reachable again" "Fetching from GitHub works again."
+    notify default "Git server reachable again" "Fetching from the Git server works again."
   fi
 
   target="$(target_rev)"
@@ -483,7 +843,7 @@ cmd_data() {
     }
     prune_data "$dir" || failed+=("prune $dir")
   done
-  borg compact || failed+=("compact")
+  bk_compact || failed+=("compact")
 
   if (( ${#failed[@]} > 0 )); then
     notify high "Data backup problems" "These failed: ${failed[*]}. Check the journal for details."
@@ -511,7 +871,7 @@ cmd_backup() {
     backup_stack "$stack" manual "${rev:-none}" || { $stop && dc "$stack" start; die "backup of $stack failed"; }
     if $stop; then dc "$stack" start; fi
   done
-  log "Done. Manual backups are not pruned; delete them with 'borg delete ::<archive>' when no longer needed."
+  log "Done. Manual backups are not pruned; delete them with '$(bk_delete_hint)' when no longer needed."
 }
 
 # ---------------------------------------------------------------------------
@@ -520,7 +880,7 @@ cmd_backup() {
 
 cmd_list() {
   valid_stack "${1:-}"
-  borg list --glob-archives "$1@*" --sort-by timestamp --format '{archive:<70} {time}{NL}'
+  bk_list "$1"
 }
 
 cmd_extract() {
@@ -529,7 +889,7 @@ cmd_extract() {
   [[ -n $archive && -n $dest ]] || die "usage: stackctl extract <stack> <archive> <dir>"
   [[ $archive == "$stack@"* ]] || die "archive $archive does not belong to $stack"
   mkdir -p "$dest"
-  (cd "$dest" && borg extract "::$archive" "$stack")
+  bk_extract "$archive" "$dest" "$stack" noown
   echo "Extracted to $dest/$stack. Files are owned by you; original ownership is not kept."
 }
 
@@ -546,7 +906,7 @@ cmd_restore() {
   dir="$STACKS_DIR/$stack"
 
   if [[ -z $archive ]]; then
-    mapfile -t archives < <(borg list --short --sort-by timestamp --glob-archives "$stack@*" | tac)
+    mapfile -t archives < <(bk_names "$stack" | tac)
     (( ${#archives[@]} > 0 )) || die "no backups found for $stack"
     [[ -t 0 ]] || die "no archive given and not running interactively"
     echo "Backups of $stack, newest first:"
@@ -556,7 +916,7 @@ cmd_restore() {
     archive="${archives[$((n - 1))]}"
   fi
   [[ $archive == "$stack@"* ]] || die "archive $archive does not belong to $stack"
-  borg info "::$archive" > /dev/null || die "archive $archive not found"
+  bk_exists "$archive" || die "archive $archive not found"
 
   if ! $yes; then
     cat <<EOF
@@ -582,9 +942,9 @@ EOF
     log "Moved the current folder to $saved"
   fi
 
-  if ! (cd "$STACKS_DIR" && in_userns borg extract --numeric-ids "::$archive" "$stack"); then
+  if ! bk_extract "$archive" "$STACKS_DIR" "$stack" keep; then
     log "Restore failed"
-    if [[ -d $dir ]]; then in_userns rm -rf -- "$dir"; fi
+    if [[ -d $dir ]]; then as_owner rm -rf -- "$dir"; fi
     if [[ -n $saved ]]; then mv "$saved" "$dir" && log "Put the previous folder back"; fi
     die "restore of $stack failed; it is stopped and on hold"
   fi
@@ -605,7 +965,7 @@ EOF
 $stack is running from $archive and is ON HOLD.
 
 To keep it on this version:
-  revert the update in GitHub, then run: stackctl release $stack
+  revert the update in Git, then run: stackctl release $stack
 Releasing without reverting will update it to the latest main again
 (taking a fresh backup first).
 EOF
@@ -639,7 +999,7 @@ cmd_release() {
 cmd_status() {
   local target="" stack dep state note running
   local -a all
-  if fetch_repo 2> /dev/null; then target="$(target_rev)"; else echo "Warning: could not fetch from GitHub, showing last known state"; target="$(target_rev 2> /dev/null || true)"; fi
+  if fetch_repo 2> /dev/null; then target="$(target_rev)"; else echo "Warning: could not fetch from the Git server, showing last known state"; target="$(target_rev 2> /dev/null || true)"; fi
   echo "Repo: $GIT_REMOTE ($BRANCH at ${target:0:7})"
   echo "Stacks: $STACKS_DIR"
   echo
@@ -666,27 +1026,8 @@ cmd_status() {
 }
 
 cmd_init() {
-  local export_file="$STATE_DIR/borg-key-export.txt"
-  if borg info > /dev/null 2>&1; then
-    echo "Borg repo already exists and is readable, nothing to create."
-  else
-    log "Creating Borg repo at $BORG_REPO"
-    borg init --encryption=repokey-blake2
-  fi
-  if [[ ! -f $export_file ]]; then
-    (umask 077 && borg key export "$BORG_REPO" "$export_file")
-  fi
+  bk_init
   fetch_repo
-  cat <<EOF
-
-Done. IMPORTANT: copy both of these somewhere safe off this server,
-such as your password manager, then delete the export file:
-
-  Borg key:        $export_file
-  Borg passphrase: the output of: $BORG_PASSCOMMAND
-
-Without both, the backups can't be restored if this server is lost.
-EOF
 }
 
 cmd_adopt() {
@@ -724,7 +1065,7 @@ cmd_clean() {
   find "$TRASH_DIR" -mindepth 1 -maxdepth 1 -printf '  %f\n'
   read -rp "Delete them permanently? [y/N] " answer
   [[ $answer == [yY] ]] || die "cancelled"
-  in_userns find "$TRASH_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  as_owner find "$TRASH_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
   echo "Cleaned"
 }
 
@@ -744,63 +1085,91 @@ check() { # label, command...
   fi
 }
 
+skip() { printf '  [SKIP] %s\n' "$1"; } # label: not configured, so not a failure
+
 borg_version_ok() { [[ "$(borg --version | awk '{print $2}')" =~ ^1\.([2-9]|[1-9][0-9])\. ]]; }
-userns_ok() { [[ "$(in_userns id -u)" == 0 ]]; }
+userns_ok() { [[ "$(as_owner id -u)" == 0 ]]; }
 linger_ok() { [[ "$(loginctl show-user "$(id -un)" -p Linger --value)" == yes ]]; }
-disk_ok() { df -Pk "$STACKS_DIR" | awk 'NR == 2 { exit !($4 > 2097152) }'; }
+disk_ok() { df -Pk "$1" | awk 'NR == 2 { exit !($4 > 2097152) }'; }
+
+# Does the Docker daemon's mode match the mode stackctl is running in?
+docker_mode_ok() {
+  local opts
+  opts="$(docker info --format '{{.SecurityOptions}}')" || return 1
+  if [[ $MODE == rootless ]]; then [[ $opts == *rootless* ]]; else [[ $opts != *rootless* ]]; fi
+}
+
 ntfy_ok() {
-  [[ -n ${NTFY_URL:-} ]] || return 1
   local args=(-fsS -m 15 -H "Title: $HOST: stackctl test" -H "Tags: test_tube" -d "Test notification from stackctl test")
   if [[ -n ${NTFY_TOKEN:-} ]]; then args+=(-H "Authorization: Bearer $NTFY_TOKEN"); fi
   curl "${args[@]}" "$NTFY_URL"
 }
 
-borg_roundtrip() {
+backup_roundtrip() {
   local tmp name ok=1
   tmp="$(mktemp -d)"
-  name="stackctl-selftest@$(date +%s)"
+  name="stackctl-selftest@selftest@$(date +%Y-%m-%dT%H%M%S)@none"
   echo "stackctl self-test $(date)" > "$tmp/probe.txt"
   mkdir "$tmp/out"
-  if (cd "$tmp" && in_userns borg create "::$name" probe.txt) \
-    && (cd "$tmp/out" && in_userns borg extract "::$name") \
+  if bk_create "$name" "$tmp" probe.txt stack \
+    && bk_extract "$name" "$tmp/out" probe.txt keep \
     && cmp -s "$tmp/probe.txt" "$tmp/out/probe.txt"; then
     ok=0
   fi
-  borg delete "::$name" > /dev/null 2>&1 || true
+  bk_delete "$name" > /dev/null 2>&1 || true
   rm -rf "$tmp"
   return "$ok"
 }
 
 cmd_test() {
   local notify_test=true t
+  local -a tools=(git docker flock tar cmp)
   if [[ ${1:-} == --no-notify ]]; then notify_test=false; fi
+  if [[ $MODE == rootless ]]; then tools+=(nsenter); fi
+  if [[ $BACKUP_BACKEND == borg ]]; then tools+=(borg); else tools+=("$TAR_COMPRESSION"); fi
+  if [[ -n $NTFY_URL ]]; then tools+=(curl); fi
 
-  echo "stackctl $VERSION self-test on $HOST"
+  echo "stackctl $VERSION self-test on $HOST ($MODE Docker, $BACKUP_BACKEND backups)"
   echo
   echo "Tools:"
-  for t in git borg docker nsenter flock curl tar cmp; do check "$t installed" command -v "$t"; done
-  check "Borg is version 1.2 or newer (1.x)" borg_version_ok
+  for t in "${tools[@]}"; do check "$t installed" command -v "$t"; done
+  if [[ $BACKUP_BACKEND == borg ]]; then check "Borg is version 1.2 or newer (1.x)" borg_version_ok; fi
   check "Docker Compose plugin" docker compose version
   echo
   echo "Server:"
   check "Stacks folder exists ($STACKS_DIR)" test -d "$STACKS_DIR"
-  check "At least 2 GB free for the stacks folder" disk_ok
-  check "Rootless Docker is reachable" docker info
-  check "Can enter rootless Docker's user namespace" userns_ok
-  check "Lingering enabled (Docker keeps running when logged out)" linger_ok
-  check "Hourly update timer active" systemctl --user is-active --quiet stackctl-update.timer
-  check "Nightly backup timer active" systemctl --user is-active --quiet stackctl-nightly.timer
+  check "At least 2 GB free for the stacks folder" disk_ok "$STACKS_DIR"
+  check "Docker is reachable" docker info
+  check "Docker is running in $MODE mode" docker_mode_ok
+  if [[ $MODE == rootless ]]; then
+    check "Can enter rootless Docker's user namespace" userns_ok
+    check "Lingering enabled (Docker keeps running when logged out)" linger_ok
+  fi
+  check "Hourly update timer active" sctl is-active --quiet stackctl-update.timer
+  check "Nightly backup timer active" sctl is-active --quiet stackctl-nightly.timer
+  if [[ -n $DATA_DIRS ]]; then
+    check "Data backup timer active" sctl is-active --quiet stackctl-data.timer
+  fi
   echo
   if [[ -n $DATA_DIRS ]]; then
     echo "Data folders:"
-    for t in $DATA_DIRS; do check "$t is readable inside the user namespace" in_userns test -r "$t"; done
+    for t in $DATA_DIRS; do check "$t is readable by the backup" as_owner test -r "$t"; done
     echo
   fi
   echo "Remote services:"
-  check "GitHub repo readable with the deploy key" fetch_repo
-  check "Borg repo reachable and passphrase correct" borg info
-  check "Borg backup and restore round trip" borg_roundtrip
-  if $notify_test; then check "ntfy notification sent" ntfy_ok; fi
+  check "Git repo readable ($GIT_REMOTE)" fetch_repo
+  if [[ $BACKUP_BACKEND == borg ]]; then
+    check "Borg repo reachable and passphrase correct" bk_info
+  else
+    check "Backup folder exists and is writable ($BACKUP_DIR)" bk_info
+    check "At least 2 GB free for backups" disk_ok "$BACKUP_DIR"
+  fi
+  check "Backup and restore round trip" backup_roundtrip
+  if [[ -z $NTFY_URL ]]; then
+    skip "ntfy notification (NTFY_URL not set)"
+  elif $notify_test; then
+    check "ntfy notification sent" ntfy_ok
+  fi
   echo
 
   if [[ -n "$(ls -A "$STATE_DIR/holds" 2> /dev/null)" ]]; then
@@ -853,4 +1222,5 @@ main() {
   esac
 }
 
-main "$@"
+# Only run when executed, so tests can source the functions.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
