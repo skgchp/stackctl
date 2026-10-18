@@ -38,3 +38,29 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+
+  release:
+    name: Tag and release
+    # Runs only on main, after the tests and scan pass. Creates a release when VERSION is new.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create tag and release if VERSION is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' stackctl | head -1)"
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "VERSION is not X.Y.Z: '$version'"; exit 1; }
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null; then
+            echo "$tag already exists, nothing to do"
+            exit 0
+          fi
+          notes="$(awk -v v="$version" '$0 == "## " v { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md)"
+          [[ -n $notes ]] || { echo "CHANGELOG.md has no '## $version' entry"; exit 1; }
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes "$notes"

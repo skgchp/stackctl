@@ -73,7 +73,8 @@ real update, restore and `extract` round trip, for each mode and backend you tou
 ## Releasing
 
 1. Bump `VERSION`, update `CHANGELOG.md`, run `./test/smoke.sh` and `./test/tar.sh`.
-2. Commit, then tag `vX.Y.Z`. Users install from a checkout of the tag.
+2. Merge to `main`. CI then creates the `vX.Y.Z` tag and GitHub release from `VERSION`, using the matching
+   `CHANGELOG.md` entry as the notes. It fails if that entry is missing. Users install from a checkout of the tag.
 
 ## Git
 
