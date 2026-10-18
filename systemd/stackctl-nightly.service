@@ -1,5 +1,5 @@
 [Unit]
-Description=stackctl: nightly Borg backup of all stacks
+Description=stackctl: nightly backup of all stacks
 
 [Service]
 Type=oneshot

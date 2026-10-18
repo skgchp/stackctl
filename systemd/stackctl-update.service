@@ -1,5 +1,5 @@
 [Unit]
-Description=stackctl: deploy changed stacks from GitHub
+Description=stackctl: deploy changed stacks from Git
 After=network-online.target docker.service
 Wants=network-online.target
 

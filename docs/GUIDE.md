@@ -1,185 +1,222 @@
-# stackctl guide: setup and day-to-day use
+# stackctl guide
 
-`stackctl` deploys your Docker Compose stacks from a GitHub repo and backs them up to a Borg repo
-(a Hetzner Storage Box). It runs as the Docker user against rootless Docker, from systemd user timers.
-See the [README](../README.md) for the command reference.
+This guide covers setup and day-to-day use. The [README](../README.md) has the command list.
 
-On a server built with [debian-server-scripts](https://github.com/skgchp/debian-server-scripts), its
-stage 85 does the install and key steps below for you: follow that repo's `docs/STACKCTL.md` for
-those, and come back here for everything else.
+The examples use rootless paths. For rootful Docker, use `/etc/stackctl` instead of `~/.config/stackctl`,
+`/var/lib/stackctl` instead of `~/.local/state/stackctl`, and leave out `--user` from `systemctl` and
+`journalctl`. In rootful mode, container-owned files are read and restored as root with their numeric owners
+kept, so there is no `nsenter` step and no lingering.
 
-## How it fits together
+## How it works
 
-1. **Renovate** (the Mend Renovate GitHub App) opens a pull request in your stacks repo when a newer image is available.
-2. **Trivy scan** (GitHub Actions) comments on the pull request with what the update fixes and introduces.
-3. **Minor, patch and digest updates merge themselves** overnight once the Trivy check passes and the release is at least
-   three days old (see `renovate.json` in the stacks repo). **Major updates never do**: you review and merge them. Postgres
-   majors are not offered at all (they need a dump and restore), and Nextcloud majors arrive one PR per major, labelled
-   `manual-migration`. Either way, anything on `main` goes live within the hour, so a direct push is as live as a merge.
-4. **stackctl update** runs hourly on the VPS. For each stack whose folder changed, it:
-   - pre-pulls the new images while the stack keeps running
-   - stops the stack and backs it up to Borg, so the backup is consistent
-   - writes out the new files, then runs `docker compose pull` and `docker compose up -d`
-5. **stackctl nightly** backs up every stack each night, live unless the stack has a `.backup-stop` file, then prunes old archives.
-6. You get an ntfy notification for updates and for anything that goes wrong.
+Your stacks live in a Git repository: one top-level folder per stack, each holding a compose file. Add
+`data/` and `.env` to the repository's `.gitignore`.
 
-The stacks repo is separate from this one: one top-level folder per stack, each with a `compose.yaml`
-(or `compose.yml`, `docker-compose.yaml`, `docker-compose.yml`). Add `data/` and `.env` to its `.gitignore`.
-Renovate and Trivy configuration (`renovate.json`, `.github/workflows/trivy-scan.yml`,
-`.github/scripts/trivy-pr-scan.sh`) lives in that repo, not here. See Part 1.
+Every hour, `stackctl update` fetches the repository. For each stack whose folder has changed, it:
 
-### Why the VPS keeps a mirror rather than a working copy
+1. pulls the new images while the stack keeps running;
+2. stops the stack and backs it up, so the backup is consistent;
+3. writes the new files, then runs `docker compose pull` and `docker compose up -d`.
 
-`stackctl` keeps a private copy of the repo in `~/.local/state/stackctl/repo.git` and writes each stack's files individually, instead of running `git pull` in the stacks folder. This lets one stack sit on an older version (after a restore, or while on hold) while the others keep updating. Your data and `.env` files are never touched, because only files tracked in Git are written or removed.
+Every night, `stackctl nightly` backs up each stack and deletes old backups according to your `KEEP_*`
+settings. A stack keeps running during its nightly backup unless its folder contains a `.backup-stop` file.
 
-### What happens when things go wrong
+stackctl keeps its own copy of the repository and writes each stack's tracked files itself, instead of
+running `git pull` in the stacks folder. That lets one stack stay on an older version, after a restore or
+while on hold, while the others update. Untracked files are never touched.
+
+Anything on the deployed branch goes live within the hour, so a direct push is as live as a merge. If you
+use Renovate to open pull requests for new images, or Trivy to scan them, configure them in the stacks
+repository. stackctl does not need either.
+
+### When something goes wrong
 
 | Situation | What stackctl does |
 |---|---|
-| GitHub unreachable | Skips the run and notifies once, then again when it recovers |
-| Pre-update backup fails | Restarts the stack unchanged, notifies, retries next hour |
-| A tracked file was edited on the server | Skips that stack, puts it on hold, notifies with the file list |
+| Git server unreachable | Skips the run, notifies once, and notifies again when it recovers |
+| Pre-update backup fails | Restarts the stack unchanged, notifies, and retries next hour |
+| A tracked file was edited on the server | Skips the stack, puts it on hold and lists the files |
 | New version fails to start | Puts the stack on hold and notifies urgently. The pre-update backup is ready for `stackctl restore` |
-| A stack is removed from the repo | Leaves it running and notifies you to take it down by hand |
-| Nightly backup or prune fails | Notifies with the failed stacks |
+| A stack is removed from the repository | Leaves it running and tells you to take it down by hand |
+| Nightly backup or pruning fails | Notifies with the names of the failed stacks |
 
-A held stack is never touched by updates until you run `stackctl release <stack>`, so a broken update can't be retried hourly and push your good backups out of retention.
+A stack on hold stays untouched until you run `stackctl release <stack>`.
 
-### What is and is not backed up
+### What is backed up
 
-Borg archives each stack's **folder** (`~/stacks/<stack>`), including bind-mounted data under it.
+Each backup contains a stack's folder, including bind-mounted data inside it.
 
-> **Named Docker volumes are not backed up.** They live in `~/.local/share/docker/volumes`, outside the
-> stack folder, so a restore would bring the stack back with empty volumes. Use bind mounts under the
-> stack folder (`./data:/var/lib/...`) for anything you cannot lose.
+> Named Docker volumes are not backed up. They live in Docker's data root (`~/.local/share/docker/volumes`
+> for rootless, `/var/lib/docker/volumes` for rootful), so a restore would bring the stack back with empty
+> volumes. Use bind mounts inside the stack folder (`./data:/var/lib/...`) for anything you cannot lose.
 
-## What you set up
+## 1. Install
 
-| Step | Where |
-|---|---|
-| Add a read-only deploy key to the stacks repo | Part 3 |
-| Create the Hetzner sub-account and install the Storage Box key | Part 4 |
-| Create the ntfy user and token | Part 5 |
-| Run `stackctl init`; copy the key export and passphrase off the server | Part 6 |
-| Run `stackctl adopt` on a server with existing stacks | Part 7 |
-| Enable the timers and run `stackctl test` | Parts 8 and 9 |
-
-Everything below runs as the Docker user (`dockeruser` in debian-server-scripts), not root, unless it says otherwise.
-
-## Part 1: GitHub (the stacks repo)
-
-1. Create the private repo and push your stack folders, plus `renovate.json`, `.github/workflows/trivy-scan.yml` and `.github/scripts/trivy-pr-scan.sh`.
-2. Check **Settings > Actions > General** allows actions to run. GitHub-hosted runners on a private repo come out of your free Actions minutes, which a scan every so often won't get near.
-3. Install the Mend Renovate app from `github.com/apps/renovate` and choose **Only select repositories**. With `renovate.json` already in the repo, Renovate starts without an onboarding pull request. Your stacks repo's `renovate.json` can automerge minor, patch and digest updates (after Trivy and a release-age delay) and leave majors to you, which is how the live repo is set up. For approval on every update, drop the automerge rule.
-
-Validate any change to `renovate.json` before merging it. A single invalid rule makes Renovate pause **all** pull requests: `npx --yes --package renovate -- renovate-config-validator renovate.json`.
-
-On GitHub Free, private repos can't enforce branch protection. That's fine for a one-person repo, but remember that a direct push to `main` goes live within the hour just like a merge. With GitHub Pro you can require pull requests for `main`.
-
-## Part 2: Install and configure
-
-Follow [Manual install](../README.md#manual-install): put the binary at `/usr/local/bin/stackctl`, copy
-`stackctl.conf.example` to `~/.config/stackctl/stackctl.conf` (mode 0600) and set at least:
+Run `./install.sh` from a checkout of a release tag. It covers steps 1 to 7 of this guide interactively. To
+do it by hand, install the script as root:
 
 ```bash
-GIT_REMOTE="git@github.com:YOUR-USER/YOUR-REPO.git"
-BORG_REPO="ssh://u123456-sub1@u123456.your-storagebox.de:23/./backups/myhost"
+install -m 0755 stackctl /usr/local/bin/stackctl
 ```
 
-Generate the two keys and the Borg passphrase, which must exist before the later parts:
+Then create the config file and install the units.
+
+Rootless, as the Docker user:
 
 ```bash
-ssh-keygen -t ed25519 -N '' -f ~/.ssh/github-deploy
-ssh-keygen -t ed25519 -N '' -f ~/.ssh/storagebox
+mkdir -p ~/.config/stackctl ~/.config/systemd/user
+cp stackctl.conf.example ~/.config/stackctl/stackctl.conf
+chmod 600 ~/.config/stackctl/stackctl.conf
+cp systemd/* ~/.config/systemd/user/ && systemctl --user daemon-reload
+loginctl enable-linger "$USER"      # needs sudo on some systems
+```
+
+Rootful, as root:
+
+```bash
+mkdir -p /etc/stackctl && chmod 700 /etc/stackctl
+cp stackctl.conf.example /etc/stackctl/stackctl.conf && chmod 600 /etc/stackctl/stackctl.conf
+cp systemd/* /etc/systemd/system/ && systemctl daemon-reload
+```
+
+Edit the config file. Set at least `STACKS_DIR`, `GIT_REMOTE`, and either `BORG_REPO` or `BACKUP_DIR`.
+Leave the timers off for now.
+
+## 2. Give the server read access to the repository
+
+Use an SSH deploy key or an HTTPS access token. Both are read-only.
+
+### SSH deploy key
+
+```bash
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/git-deploy
+```
+
+Add `git-deploy.pub` to the repository as a deploy key, with write access off:
+
+- GitHub: Settings > Deploy keys > Add deploy key
+- GitLab: Settings > Repository > Deploy keys
+- Forgejo and Gitea: Settings > Deploy Keys > Add Deploy Key
+
+In the config, set `GIT_SSH_KEY` to the private key. Put a non-standard SSH port in the URL, for example
+`ssh://git@forgejo.example.com:2222/you/stacks.git`.
+
+stackctl never accepts an unknown host key automatically, so record the server's host keys in a file and
+point `GIT_KNOWN_HOSTS` at it. For GitHub, use the keys supplied in this repository:
+
+```bash
+install -m 0644 github_known_hosts ~/.config/stackctl/known_hosts-git
+```
+
+For any other server, scan its keys and check the fingerprints against the ones the server publishes:
+
+```bash
+ssh-keyscan -p 22 -t ed25519,ecdsa,rsa git.example.com > ~/.config/stackctl/known_hosts-git
+ssh-keygen -lf ~/.config/stackctl/known_hosts-git
+```
+
+### HTTPS access token
+
+Create a read-only token:
+
+- GitHub: a fine-grained token with Contents set to read-only
+- GitLab: a project access token with `read_repository`, or a deploy token
+- Forgejo and Gitea: an application token with `read:repository`
+
+Save it to a file that only you can read:
+
+```bash
+(umask 077 && printf '%s\n' 'THE-TOKEN' > ~/.config/stackctl/git-token)
+```
+
+In the config, set `GIT_REMOTE` to the `https://` URL, `GIT_TOKEN_FILE` to that file, and `GIT_USERNAME` to
+`oauth2`. A GitLab deploy token has its own username (`gitlab+deploy-token-N`). stackctl reads the token from
+the file when Git asks for it. It never appears on a command line, in the environment or in the logs.
+
+## 3. Choose where backups go
+
+Pick one. Both take a backup before every update and one every night, with the same retention settings.
+
+### Tar files
+
+Set `BACKUP_DIR` to an absolute path. Each backup becomes one `.tar.zst` file (`.tar.gz` if `zstd` is not
+installed) in `BACKUP_DIR/<stack>/`. These backups are not encrypted or deduplicated, and a backup on the
+same disk is lost if the disk fails. Use a separate disk or mount, or copy the folder elsewhere with rsync or
+to a NAS.
+
+### Borg
+
+Borg makes encrypted, deduplicated backups to a local or remote repository. These steps cover a remote
+repository reached over SSH. The examples use `backup-user@backup.example.com`.
+
+1. Create a key and a passphrase file:
+
+```bash
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/borg
 (umask 077 && head -c 32 /dev/urandom | base64 > ~/.config/stackctl/borg-passphrase)
-cat github_known_hosts >> ~/.ssh/known_hosts      # GitHub's pinned host keys, from this repo
 ```
 
-Do not enable the timers yet. Every option is documented in `stackctl.conf.example`.
-
-## Part 3: GitHub deploy key
-
-In the stacks repo, go to **Settings > Deploy keys > Add deploy key**, paste the `github-deploy` public key
-(`cat ~/.ssh/github-deploy.pub`), and leave **Allow write access** unticked.
-
-Test it:
+2. Install the public key on the backup host (`~/.ssh/borg.pub`), for example with
+   `ssh-copy-id -i ~/.ssh/borg.pub backup-user@backup.example.com`. The host needs Borg 1.x installed. If its
+   binary has another name, such as `borg-1.4`, set `BORG_REMOTE_PATH` to it.
+3. Record the host's key in a file, then check the fingerprint against the one your provider publishes:
 
 ```bash
-ssh -i ~/.ssh/github-deploy -o IdentitiesOnly=yes -T git@github.com
+ssh-keyscan -t ed25519,ecdsa,rsa backup.example.com > ~/.config/stackctl/known_hosts-borg
+ssh-keygen -lf ~/.config/stackctl/known_hosts-borg
 ```
 
-It should greet you with the repo name and say shell access isn't provided. `github_known_hosts` already pinned
-GitHub's host keys, so there is no trust-on-first-use prompt. They come from GitHub's published list
-(`https://api.github.com/meta`).
-
-## Part 4: Hetzner Storage Box
-
-In the Hetzner console:
-
-1. Create a **sub-account** for this VPS with its own base directory, for example `vps-borg`.
-2. Enable **SSH support** for the sub-account, and **external reachability** if the VPS is outside Hetzner.
-3. On the main Storage Box, turn on **automatic snapshots** (for example daily, keeping 7). The VPS can't delete these, so they protect you if the server is ever compromised.
-
-Note the sub-account's username, which looks like `u123456-sub1`. Sub-accounts connect to the **main
-account's hostname** (`u123456.your-storagebox.de`), with the sub-account username. Borg needs SSH on **port 23**.
-Then install the `storagebox` key on it.
-It asks for the sub-account password once, and skips keys already installed:
+4. Create the parent folder of the repository on the host, because Borg does not:
+   `ssh -i ~/.ssh/borg backup-user@backup.example.com mkdir backups`.
+5. Set these in the config, using absolute paths:
 
 ```bash
-ssh-copy-id -p 23 -s -i ~/.ssh/storagebox.pub u123456-sub1@u123456.your-storagebox.de
+BORG_REPO="ssh://backup-user@backup.example.com/./backups/myhost"
+BORG_PASSCOMMAND="cat /home/you/.config/stackctl/borg-passphrase"
+BORG_RSH="ssh -F /home/you/.config/stackctl/ssh_config -i /home/you/.ssh/borg -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=/home/you/.config/stackctl/known_hosts-borg"
 ```
 
-Test the connection, which also records the Storage Box's host key:
+With rootless Docker, Borg runs inside Docker's user namespace, where `/etc/ssh` looks like it belongs to
+`nobody` and ssh looks for known hosts under `/root`. The `-F` option and `UserKnownHostsFile` above avoid
+that, so create an empty ssh config with `touch ~/.config/stackctl/ssh_config`. With rootful Docker, drop the
+`-F` option.
+
+Some providers need a special port or path. For example, a Hetzner Storage Box uses SSH port 23 and a path
+that starts `/./`, as in `ssh://user@host:23/./backups/myhost`, and its sub-accounts connect to the main
+account's hostname.
+
+## 4. Set up notifications (optional)
+
+Leave `NTFY_URL` empty to skip this. stackctl then only writes to the journal, and `stackctl test` reports
+ntfy as skipped.
+
+On your ntfy server, create a user that can only publish to one topic. You may need `sudo`.
 
 ```bash
-ssh -p 23 -i ~/.ssh/storagebox -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new u123456-sub1@u123456.your-storagebox.de ls
+ntfy user add stackctl
+ntfy access stackctl stackctl write-only
+ntfy token add stackctl
 ```
 
-Compare the fingerprint against the ones Hetzner publishes in its
-[Storage Box overview](https://docs.hetzner.com/storage/storage-box/general/) before trusting it
-(ED25519 `SHA256:XqONwb1S0zuj5A1CDxpOSuD2hnAArV1A3wKY7Z3sdgM`, RSA `SHA256:EMlfI8GsRIfpVkoW1H2u0zYVpFGKkIMKHFZIRkf2ioI`
-at the time of writing; check the page if they differ). Without this step Borg fails with
-`Host key verification failed`, because stackctl never auto-accepts host keys.
+Put the token (it starts with `tk_`) in `NTFY_TOKEN`. Set `NTFY_URL` to the address including the topic, for
+example `https://ntfy.example.com/stackctl`. Without the topic, ntfy answers 404 or 400. Then subscribe to
+the topic on your phone.
 
-Then create the folder that will hold the repo's **parent**, because Borg won't create it
-(`Repository … does not exist` / `The parent path of the repo directory … does not exist`):
+Two things to watch for:
 
-```bash
-ssh -p 23 -i ~/.ssh/storagebox -o IdentitiesOnly=yes u123456-sub1@u123456.your-storagebox.de mkdir backups
-```
+- If ntfy denies anonymous access, an empty token makes every notification fail with `403`.
+- If ntfy runs as one of your stacks, it cannot report problems while it is down. Monitor the server from
+  somewhere else as well.
 
-Your `BORG_REPO` is then `ssh://u123456-sub1@u123456.your-storagebox.de:23/./backups/myhost`. The
-`:23` and the `/./` (path relative to the sub-account's home, not the server's filesystem root) are both
-required for a Storage Box.
-
-## Part 5: ntfy token
-
-On your ntfy server, create a user that can only publish to one topic. These commands may need `sudo`,
-depending on how ntfy is installed:
-
-```bash
-ntfy user add vps-deploy
-ntfy access vps-deploy vps-deploy write-only
-ntfy token add vps-deploy
-```
-
-Put the token (it starts with `tk_`) in `NTFY_TOKEN`, and set `NTFY_URL` **including the
-topic**: `https://ntfy.example.com/vps-deploy` (without the topic ntfy answers 404/400). Then subscribe to the `vps-deploy` topic on your phone.
-
-If your ntfy denies anonymous access (`auth-default-access: deny-all`), an **empty** token makes every
-notification fail with `403`, which is easy to miss. If ntfy runs as one of your stacks, it only receives
-notifications once Traefik and ntfy are both up; until then alerts (including "Cannot reach GitHub") can't
-be delivered. Consider also watching the server from somewhere else, since a notification about the server
-dying can't be sent through the server.
-
-## Part 6: Create the Borg repo
+## 5. Create the backup target
 
 ```bash
 stackctl init
 ```
 
-**Before going further,** copy the exported key file and the passphrase into your password manager,
-then delete the export. Without both, the backups can't be restored if the VPS is lost:
+For tar, this creates `BACKUP_DIR`. For Borg, it creates the repository and exports its key. With Borg, save
+the key export and the passphrase in your password manager, then delete the export. Without both, you cannot
+restore if the server is lost.
 
 ```bash
 cat ~/.local/state/stackctl/borg-key-export.txt
@@ -187,114 +224,82 @@ cat ~/.config/stackctl/borg-passphrase
 rm ~/.local/state/stackctl/borg-key-export.txt
 ```
 
-## Part 7: Bring your existing stacks under stackctl
+## 6. Bring in existing stacks
 
-**Read this before enabling automatic updates on a server whose data came from somewhere else.** `stackctl`
-deploys whatever is on `main` of your stacks repo. If Renovate has been merging image bumps while your data
-stayed behind, the first deploy would run new images against old data. In practice that means:
+Skip this on a new server. On a server that already runs stacks, read it before enabling updates.
 
-- **Postgres**: a major version bump (for example 16 to 18) cannot start on the old data directory. The
-  official `postgres:18` image also keeps its data in `/var/lib/postgresql/18/docker`, so a compose file that
-  mounts `/var/lib/postgresql/data` would start with an **empty database** and leave your data unused.
-  Migrate with a dump and restore, and fix the mount, before releasing the stack.
-- **Nextcloud** refuses to skip major versions (32 to 35 must go 33, then 34, then 35).
-- **Host paths** in compose files (for example `/mnt/data/...`) must exist on the new server.
-- Compare the data's real version with the image you are about to run (`PG_VERSION` in a Postgres data
-  directory, `version.php` for Nextcloud) before the first update.
+stackctl deploys whatever is on the deployed branch. If the image versions in the repository are newer than
+the data on this server, the first deploy runs new images against old data. Some apps cannot start on data
+from an older major version, or need each major release in turn. Before enabling updates:
 
-Protect those stacks first. `hold` stops any update of a stack, and leaving `stackctl-update.timer` disabled keeps the
-nightly backup timer while disabling automatic deploys:
+- Compare each stack's data version with the image the repository will deploy.
+- Check that host paths in compose files, such as `/mnt/data/...`, exist on this server.
+
+Hold any stack whose data needs migrating, preview what would change, and take a baseline backup:
 
 ```bash
-stackctl hold vaultwarden "Postgres 16 data, repo is 18"
-stackctl update --dry-run        # shows exactly which stacks would change
+stackctl hold app "data needs migrating first"
+stackctl update --dry-run
+stackctl backup app --stop
 ```
 
-Take a baseline backup of every stack (`stackctl backup <stack>... [--stop]`) before changing anything.
-Then migrate one stack at a time and `stackctl release` it when its data matches the repo.
+Migrate one stack at a time, following the app's own upgrade instructions, then run `stackctl release app`.
+stackctl never touches untracked files, so you can add a temporary `docker-compose.override.yml` during a
+migration (for example to stop a service starting) and delete it afterwards.
 
-### Recipe: Postgres 16 to 18 (one stack at a time)
+### Data copied from another server
 
-This worked for Vaultwarden and Forgejo with every table's row count identical afterwards. Replace
-`<stack>`, `<db-service>`, `<user>` and `<db>` (the compose service, `POSTGRES_USER` and `POSTGRES_DB`).
-
-1. Put the stack on hold, then take a consistent dump from the **running** old database and record row counts:
-   `docker exec <db-service> pg_dump -U <user> -Fc <db> > dump`, plus a `count(*)` per table.
-   Check that the dump is readable (`pg_restore -l`) and keep its checksum.
-2. Stop the stack and **move the old data directory aside** (`mv appdata/<db-service> appdata/<db-service>.pg16`).
-   Keep it until you are happy: it is your instant rollback.
-3. Make sure the compose file mounts the volume at `/var/lib/postgresql` (not `.../data`) for Postgres 18, then
-   `stackctl release <stack>` and `stackctl update`. If the app must not start against the empty new database
-   (for example it needs an intermediate version first), add an untracked `docker-compose.override.yml`
-   with `profiles: ["migration-hold"]` on the app service, and delete it afterwards. stackctl never touches
-   untracked files.
-4. Restore into the new, empty database: `pg_restore -U <user> -d <db> --no-owner --no-acl --exit-on-error < dump`.
-   If the app already created its own schema there, drop and recreate the database first.
-5. Compare the row counts, then start the app. It runs its own migrations on your restored data.
-6. For apps that must not skip major versions (Forgejo, Nextcloud), step through each required release,
-   taking a fresh dump between steps.
-
-### Recipe: data copied from another server
-
-Files copied as the plain Docker user are owned by root **inside** the containers. Containers that run as a
-non-root user then fail with "not writable" or `Operation not permitted`. Postgres and apps that start as root
-cope; images like Forgejo's rootless build (uid 1000) do not. Fix ownership **inside rootless Docker's
-user namespace**, so it maps to the right sub-UID:
+On rootless Docker, files copied as the Docker user are owned by root inside the containers. Containers
+that run as another user then fail with "not writable" or "Operation not permitted". Fix the ownership
+inside Docker's user namespace, using the user ID the image runs as (find it with
+`docker run --rm --entrypoint id <image>`):
 
 ```bash
 nsenter -U --preserve-credentials -t "$(cat /run/user/$(id -u)/docker.pid)" -- \
-  chown -R 1000:1000 ~/stacks/forgejo/appdata/forgejo
+  chown -R 1000:1000 ~/stacks/app/data
 ```
 
-Use the uid the image runs as (`docker run --rm --entrypoint id <image>`). When you can, copy with ownership
-preserved instead (rsync as root inside the namespace).
+On rootful Docker, run a plain `chown -R 1000:1000` as root.
 
-The stacks folder must contain your stacks at `~/stacks/<stack>` (the same names as in the repo). If they
-live elsewhere, copy them there with `cp -a`, keeping the originals until everything works.
+### Adopt the stacks
 
-`STACKS_DIR` is `~/stacks` by default. Put your stacks there, then record which ones
-already match the repo, so the first hourly run doesn't restart them all:
+Put your stacks in `STACKS_DIR`, under the same names as in the repository, and keep any originals until
+everything works. Then record which stacks already match the repository, so the first hourly run does not
+restart them all:
 
 ```bash
 stackctl adopt
 ```
 
-Any stack listed as different from the repo will be backed up and updated on the first run. If you'd
-rather it wasn't, commit the server's version of those files to GitHub first and run `adopt` again.
-If the stacks folder is currently a Git clone, its `.git` folder is no longer used and can be removed
-once everything works.
+Stacks that differ are backed up and updated on the first run. To avoid that, commit the server's version of
+those files to Git and run `adopt` again. If the stacks folder is a Git clone, its `.git` folder is no longer
+used and can be removed once everything works.
 
-## Part 8: Start the timers
+## 7. Start the timers and test
 
 ```bash
-systemctl --user enable --now stackctl-nightly.timer stackctl-update.timer
+systemctl --user enable --now stackctl-update.timer stackctl-nightly.timer
 systemctl --user enable --now stackctl-data.timer      # only if DATA_DIRS is set
-```
-
-Skip `stackctl-update.timer` to keep backups but deploy by hand with `stackctl update`.
-
-## Part 9: Test
-
-```bash
 stackctl test
 ```
 
-This checks the tools, rootless Docker and its user namespace, lingering, both timers, GitHub access,
-the Borg repo, a full backup and restore round trip, and sends a test notification. It finishes with a
-dry run of what the next update would do. Add `--no-notify` to skip the notification.
+To keep backups but deploy by hand, leave out `stackctl-update.timer` and run `stackctl update` yourself.
 
-Run it again after any change to the server, keys or Storage Box.
+`stackctl test` checks the tools, the Docker mode, the timers, Git access, the backup target and a full
+backup and restore round trip. It sends a test notification if ntfy is set up (add `--no-notify` to skip
+that), then shows a dry run of the next update. Run it again after any change to the server, keys or backup
+target.
 
 ## Day to day
 
-### See what's going on
+### Check on things
 
 ```bash
 stackctl status
 journalctl --user -u stackctl-update.service -n 50
 ```
 
-### Apply a merged change now instead of waiting
+### Apply a merged change now
 
 ```bash
 stackctl update
@@ -307,17 +312,18 @@ stackctl list app
 stackctl restore app
 ```
 
-The restore stops the stack, moves its current folder into `.stackctl-trash`, restores the backup, starts
-it, and puts it **on hold**. To keep it on the restored version, revert the update in GitHub and then release it:
+The restore stops the stack, moves its current folder to `.stackctl-trash` in the stacks folder, restores the
+backup, starts the stack and puts it on hold. To stay on the restored version, revert the change in Git, then
+release the stack:
 
 ```bash
 stackctl release app
 ```
 
-If you release without reverting, the next run updates it to `main` again, taking a fresh backup first.
-Once you're happy, remove the set-aside folders with `stackctl clean`.
+If you release it without reverting, the next run updates it to the latest version again, after a fresh
+backup. When you are happy with the result, delete the set-aside folders with `stackctl clean`.
 
-### Get a single file back without touching the running stack
+### Get one file back without touching the running stack
 
 ```bash
 stackctl extract app app@nightly@2026-09-29T033012@a1b2c3d ~/restore-browse
@@ -330,67 +336,62 @@ stackctl hold app "migrating database by hand"
 stackctl release app
 ```
 
-### Consistent nightly backups for stacks with databases
+### Get consistent nightly backups for databases
 
-Add an empty `.backup-stop` file to the stack's folder, ideally committed to the repo. That stack is then
-stopped briefly while it's backed up each night. Note that it restarts all of the stack's services afterwards.
+Add an empty `.backup-stop` file to the stack's folder, ideally committed to the repository. The stack is
+then stopped for its nightly backup and restarted afterwards, including all of its services.
 
-### Back up a folder outside the stacks as its own job
+### Back up a folder outside the stacks
 
-Large data that lives outside the stack folders (for example Nextcloud's files on a mounted Hetzner volume)
-is not covered by the per-stack backups. Give it its own Borg job: set the folder in `stackctl.conf` and enable `stackctl-data.timer`.
+Large data outside the stack folders, such as a mounted volume, is not in the stack backups. Set the folders
+in the config and enable `stackctl-data.timer` (04:30, after the stack backups):
 
 ```bash
-DATA_DIRS="/mnt/nextcloud-data"     # space-separated absolute paths
-KEEP_DATA_DAILY=7                   # separate retention from the stacks
+DATA_DIRS="/mnt/media /mnt/archive"     # space-separated absolute paths
+KEEP_DATA_DAILY=7
 KEEP_DATA_WEEKLY=4
 KEEP_DATA_MONTHLY=3
 ```
 
-- It runs `stackctl data` from its own timer (`stackctl-data.timer`, 04:30, after the stack backups), once it is
-  enabled and `DATA_DIRS` is set. Run it by hand with `stackctl data`.
-- Each folder is its own archive series named after the folder: `nextcloud-data@data@<time>@none`. It never takes
-  part in stack updates, stack pruning or `stackctl restore`. `lost+found` is excluded, and files owned by
-  container users are read through rootless Docker's user namespace, like stack backups.
-- Browse or recover with the normal commands:
-  `stackctl list nextcloud-data` and `stackctl extract nextcloud-data <archive> <dir>`.
-- `stackctl test` checks each folder is readable inside the user namespace.
-- **Consistency:** the Nextcloud database is in the stack backups and its files are in this job, taken a
-  little apart. For a strictly consistent copy, restore the database and files from the same night, then run
-  `occ files:scan --all`. If you need an exact snapshot, put Nextcloud in maintenance mode
-  (`occ maintenance:mode --on`) around the backup.
+Each folder becomes its own series named after the folder, for example `media@data@<time>@none`. It is not
+part of updates, stack pruning or `stackctl restore`. Use `stackctl list media` and
+`stackctl extract media <archive> <dir>` to browse or recover. `lost+found` is excluded, and `stackctl test`
+checks that each folder is readable.
 
-### Skip caches in backups
+If an app keeps its database in a stack folder and its files in a data folder, the two backups are taken a
+little apart. For a consistent pair, stop the app or put it in maintenance mode around the backups, or
+restore both from the same night.
 
-Borg skips any folder containing a `CACHEDIR.TAG` file with the standard signature, which is handy for
-thumbnail or download caches. For example, for `app/data/cache`:
+### Skip caches in Borg backups
+
+Borg skips any folder containing a `CACHEDIR.TAG` file with the standard signature:
 
 ```bash
 printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > ~/stacks/app/data/cache/CACHEDIR.TAG
 ```
 
-### Manual backups
+### Take a manual backup
 
 ```bash
 stackctl backup app --stop
 ```
 
-These are named `app@manual@...` and are never pruned. Delete them with `borg delete` when you no longer need them.
+Manual backups are named `app@manual@...` and are never deleted automatically. Delete one with
+`borg delete ::<archive>` (Borg), or remove its file from `BACKUP_DIR/app/` (tar).
 
-### Update stackctl itself
+### Upgrade stackctl
 
-Install the new `stackctl` over `/usr/local/bin/stackctl`, and the unit files if they changed (then
-`systemctl --user daemon-reload`). Your config, keys and passphrase are not touched. Check
-[CHANGELOG.md](../CHANGELOG.md) first: a major version changes the config keys, paths or unit names.
+Check [CHANGELOG.md](../CHANGELOG.md). A major version can change config keys, paths or unit names. Then run
+`./install.sh --upgrade` from the new release. It replaces the script and the units, reloads systemd and
+leaves your config, keys and passphrase alone.
 
-### Test a real restore occasionally
+### Test a real restore
 
-The self-test proves Borg works, but it's worth restoring a real stack into a scratch folder with
-`stackctl extract` every few months and checking the data opens.
+The self-test proves the backup system works. Every few months, also restore a real stack into a scratch
+folder with `stackctl extract` and check that the data opens.
 
-## Idempotency
+### Running commands again
 
-- `update`, `nightly`, `adopt`, `init`, `hold`, `release` and `test` are all safe to re-run. `update` does nothing when nothing has changed, and `init` skips creating a repo that already exists.
-- `restore` is not idempotent by nature: each run sets the current folder aside and restores again.
-- `backup` creates a new archive each time it runs.
-- The ntfy commands report that the user or access rule already exists if repeated.
+`update`, `nightly`, `adopt`, `init`, `hold`, `release`, `test` and `install.sh` are safe to run again.
+`restore` sets the current folder aside and restores again each time, and `backup` makes a new backup each
+time.

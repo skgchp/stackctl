@@ -1,5 +1,5 @@
 [Unit]
-Description=Back up data folders to Borg every night
+Description=Back up data folders every night
 
 [Timer]
 OnCalendar=*-*-* 04:30:00
