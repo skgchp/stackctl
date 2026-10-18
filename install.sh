@@ -2,8 +2,9 @@
 #
 # install.sh: interactive installer for stackctl.
 #
-# Run it from a checkout of a release tag, as root for rootful Docker or as the
-# Docker user for rootless Docker. It installs the script and the systemd units,
+# Run it from a checkout of a release tag, as the user that will run stackctl:
+# normally a service account that can use Docker (rootless Docker, or a user in
+# the docker group), or root. It installs the script and the systemd units,
 # asks how you want to deploy and back up, writes the config, and runs the
 # first-time setup and self-test. It does not install Docker.
 #
@@ -12,7 +13,8 @@
 set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-BIN=/usr/local/bin/stackctl
+DEFAULT_BIN=/usr/local/bin/stackctl
+BIN=$DEFAULT_BIN
 UPGRADE=false
 MODE=""
 
@@ -22,14 +24,15 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat << 'EOT'
-Usage: ./install.sh [--upgrade] [--mode rootless|rootful]
+Usage: ./install.sh [--upgrade] [--docker-mode rootless|rootful]
 
 Installs stackctl and walks you through setting it up.
 
   --upgrade   Only replace the script and the systemd units. Leaves your
               config, keys and timers alone.
-  --mode M    Force rootless (run as the Docker user) or rootful (run as
-              root). By default: rootful when run as root, else rootless.
+  --docker-mode M
+              Say whether Docker is rootless or rootful. By default it is
+              rootless when you have your own Docker socket, else rootful.
   --help      Show this help.
 EOT
 }
@@ -37,7 +40,7 @@ EOT
 while (( $# > 0 )); do
   case $1 in
     --upgrade) UPGRADE=true ;;
-    --mode)
+    --docker-mode)
       shift
       MODE=${1:-}
       ;;
@@ -118,23 +121,12 @@ pause() { read -r -p "Press Enter when done... " _; }
 # Mode and paths
 # ---------------------------------------------------------------------------
 
-detect_mode() {
-  if [[ -z $MODE ]]; then
-    if (( EUID == 0 )); then MODE=rootful; else MODE=rootless; fi
-  fi
-  case $MODE in
-    rootful) (( EUID == 0 )) || die "rootful mode needs root: run  sudo ./install.sh" ;;
-    rootless) (( EUID != 0 )) || die "rootless mode must run as the Docker user, not root" ;;
-    *) die "--mode must be rootless or rootful" ;;
-  esac
-
+# Where things live follows the user running the installer, like stackctl itself.
+detect_user() {
   SUDO=""
-  if (( EUID != 0 )); then
-    command -v sudo > /dev/null || die "sudo is needed to install $BIN"
-    SUDO=sudo
-  fi
+  if (( EUID != 0 )) && command -v sudo > /dev/null; then SUDO=sudo; fi
 
-  if [[ $MODE == rootful ]]; then
+  if (( EUID == 0 )); then
     CONF_DIR=/etc/stackctl
     UNIT_DIR=/etc/systemd/system
     KEY_DIR=/root/.ssh
@@ -146,12 +138,31 @@ detect_mode() {
     KEY_DIR="$HOME/.ssh"
     DEFAULT_STACKS="$HOME/stacks"
     DEFAULT_BACKUPS="$HOME/backups/stackctl"
-    export DOCKER_HOST="${DOCKER_HOST:-unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock}"
   fi
   CONF="${STACKCTL_CONFIG:-$CONF_DIR/stackctl.conf}"
 }
 
-sctl() { if [[ $MODE == rootful ]]; then systemctl "$@"; else systemctl --user "$@"; fi; }
+# Rootless or rootful Docker: the flag, then an existing config, then your own Docker socket.
+detect_docker_mode() {
+  local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"
+  if [[ -z $MODE && -f $CONF ]]; then
+    MODE="$(read_cfg DOCKER_MODE)"
+    if [[ $MODE == auto ]]; then MODE=""; fi
+  fi
+  if [[ -z $MODE ]]; then
+    if (( EUID != 0 )) && [[ -S $sock ]]; then MODE=rootless; else MODE=rootful; fi
+  fi
+  case $MODE in
+    rootless)
+      (( EUID != 0 )) || die "Rootless Docker runs as a normal user: run ./install.sh as that user, not root."
+      export DOCKER_HOST="${DOCKER_HOST:-unix://$sock}"
+      ;;
+    rootful) ;;
+    *) die "--docker-mode must be rootless or rootful" ;;
+  esac
+}
+
+sctl() { if (( EUID == 0 )); then systemctl "$@"; else systemctl --user "$@"; fi; }
 
 # Value of a key in the existing config, read in a subshell so nothing leaks.
 # shellcheck disable=SC1090
@@ -203,35 +214,65 @@ check_docker() {
   docker compose version > /dev/null 2>&1 || die "The Docker Compose plugin is missing (https://docs.docker.com/compose/install/linux/)."
   local opts
   opts="$(docker info --format '{{.SecurityOptions}}' 2> /dev/null)" \
-    || die "Cannot reach the Docker daemon as $(id -un) in $MODE mode."
+    || die "Cannot reach the Docker daemon as $(id -un). For rootful Docker, the user must be in the docker group (an administrator can run: usermod -aG docker $(id -un)). For rootless Docker, its service must be running."
   if [[ $MODE == rootless && $opts != *rootless* ]]; then
-    die "This Docker daemon is not rootless. For a normal Docker install, run as root: sudo ./install.sh"
+    die "This Docker daemon is not rootless. Run again with: ./install.sh --docker-mode rootful"
   fi
   if [[ $MODE == rootful && $opts == *rootless* ]]; then
-    die "This Docker daemon is rootless. Run ./install.sh as the Docker user instead of root."
+    die "This Docker daemon is rootless. Run again with: ./install.sh --docker-mode rootless"
   fi
-  say "Docker ($MODE) and the Compose plugin are working."
+  say "Docker ($MODE) and the Compose plugin are working, running as $(id -un)."
+  if [[ $MODE == rootful ]] && (( EUID != 0 )); then
+    say "Rootful Docker as a normal user: stackctl reads files owned by container users through a small"
+    say "root container (${HELPER_IMAGE:-debian:stable-slim}), so it needs no sudo. Pulling the image now."
+    docker pull -q "${HELPER_IMAGE:-debian:stable-slim}" > /dev/null || warn "Could not pull the helper image. stackctl pulls it when it first needs it."
+  fi
 }
 
 # ---------------------------------------------------------------------------
 # Install files
 # ---------------------------------------------------------------------------
 
+# Where the script goes. /usr/local/bin needs root. Without sudo, offer ~/.local/bin, which the account
+# can change, so the timers would run a script that the account could edit.
+choose_bin() {
+  if (( EUID == 0 )); then BIN=$DEFAULT_BIN; return 0; fi
+  if [[ -x $DEFAULT_BIN ]]; then BIN=$DEFAULT_BIN; return 0; fi
+  if [[ -x $HOME/.local/bin/stackctl ]]; then BIN=$HOME/.local/bin/stackctl; return 0; fi
+  if [[ -n $SUDO ]] && $SUDO -v; then BIN=$DEFAULT_BIN; return 0; fi
+  warn "No sudo access, so $DEFAULT_BIN cannot be written."
+  if $UPGRADE || ask_yn "Install to $HOME/.local/bin/stackctl instead? (The timers will run that copy, which this account can edit.)" y; then
+    BIN=$HOME/.local/bin/stackctl
+  else
+    die "Ask an administrator to run: sudo install -m 0755 -o root -g root stackctl $DEFAULT_BIN"
+  fi
+}
+
 install_files() {
+  choose_bin
   say "Installing $BIN"
-  $SUDO install -m 0755 -o root -g root "$HERE/stackctl" "$BIN"
+  if [[ $BIN == "$DEFAULT_BIN" ]]; then
+    $SUDO install -m 0755 -o root -g root "$HERE/stackctl" "$BIN"
+  else
+    mkdir -p "$(dirname "$BIN")"
+    install -m 0755 "$HERE/stackctl" "$BIN"
+  fi
   mkdir -p "$UNIT_DIR"
   install -m 0644 "$HERE"/systemd/* "$UNIT_DIR/"
+  if [[ $BIN != "$DEFAULT_BIN" ]]; then sed -i "s#$DEFAULT_BIN#$BIN#" "$UNIT_DIR"/stackctl-*.service; fi
   sctl daemon-reload
   say "Installed the systemd units into $UNIT_DIR"
+}
 
-  if [[ $MODE == rootless ]]; then
-    if [[ "$(loginctl show-user "$(id -un)" -p Linger --value 2> /dev/null)" != yes ]]; then
-      say "Lingering keeps your Docker and the timers running when you are logged out."
-      if ask_yn "Enable lingering for $(id -un) (needs sudo)?" y; then
-        $SUDO loginctl enable-linger "$(id -un)"
-      fi
-    fi
+# User timers only run while the user has a session, unless lingering is on.
+offer_linger() {
+  (( EUID != 0 )) || return 0
+  [[ "$(loginctl show-user "$(id -un)" -p Linger --value 2> /dev/null)" != yes ]] || return 0
+  say "Lingering keeps the timers (and rootless Docker) running when $(id -un) is logged out."
+  if [[ -n $SUDO ]] && ask_yn "Enable lingering for $(id -un) (needs sudo)?" y; then
+    $SUDO loginctl enable-linger "$(id -un)"
+  else
+    warn "Ask an administrator to run: loginctl enable-linger $(id -un)"
   fi
 }
 
@@ -459,6 +500,9 @@ BACKUP_DIR="$BACKUP_DIR"
 TAR_COMPRESSION="$TAR_COMPRESSION"
 EOT
     fi
+    if [[ $MODE == rootful ]] && (( EUID != 0 )); then
+      printf '\nHELPER_IMAGE="%s"\n' "${HELPER_IMAGE:-debian:stable-slim}"
+    fi
     cat << EOT
 
 KEEP_DAILY=$KEEP_DAILY
@@ -533,7 +577,7 @@ finish() {
     if [[ -n $data ]]; then sctl enable --now stackctl-data.timer; fi
   else
     say "Enable them later with:"
-    say "  $(if [[ $MODE == rootful ]]; then echo systemctl; else echo systemctl --user; fi) enable --now stackctl-update.timer stackctl-nightly.timer"
+    say "  $(if (( EUID == 0 )); then echo systemctl; else echo systemctl --user; fi) enable --now stackctl-update.timer stackctl-nightly.timer"
   fi
 
   say
@@ -542,7 +586,8 @@ finish() {
 
   cat << EOT
 
-stackctl is installed ($MODE Docker).
+stackctl is installed ($MODE Docker, run as $(id -un)).
+  Script:   $BIN
   Config:   $CONF
   Commands: stackctl status | update | test | list <stack> | restore <stack>
   Guide:    $HERE/docs/GUIDE.md
@@ -557,7 +602,7 @@ EOT
 # ---------------------------------------------------------------------------
 
 main() {
-  detect_mode
+  detect_user
 
   if $UPGRADE; then
     install_files
@@ -566,7 +611,8 @@ main() {
   fi
 
   [[ -t 0 ]] || die "install.sh is interactive; run it from a terminal (use --upgrade for a non-interactive upgrade)."
-  say "stackctl installer ($MODE Docker)"
+  detect_docker_mode
+  say "stackctl installer ($MODE Docker, run as $(id -un))"
   say
   check_docker
   ensure_tools git ssh ssh-keygen ssh-keyscan flock tar cmp
@@ -602,6 +648,7 @@ main() {
   ensure_tools "${tools[@]}"
 
   install_files
+  offer_linger
   if ! $KEEP_CONFIG; then configure; fi
   finish
 }

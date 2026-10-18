@@ -1,16 +1,22 @@
 # stackctl configuration (mode 0600). The file is sourced by bash, so values must not contain
 #   "  $  `  or a backslash.
 #
-# Where it lives:
-#   rootless Docker (run as the Docker user): ~/.config/stackctl/stackctl.conf
-#   rootful Docker (run as root):             /etc/stackctl/stackctl.conf
+# Where it lives follows the user running stackctl:
+#   a normal user (for example a service account that can use Docker): ~/.config/stackctl/stackctl.conf
+#   root:                                                              /etc/stackctl/stackctl.conf
 # Override the location with STACKCTL_CONFIG=/path/to/file. install.sh writes this file for you.
 #
 # This file is the config contract: renaming or removing a key is a breaking change (see AGENTS.md).
 
 # ---- Docker -----------------------------------------------------------------
-# auto: rootful when run as root, rootless otherwise. Set it to make a wrong user fail loudly.
+# How Docker runs on this server:
+#   rootless  Docker runs as your user (it has its own socket in /run/user/UID).
+#   rootful   the usual Docker daemon running as root. Run stackctl as root, or as a user in the docker group.
+#   auto      rootless if your user has its own Docker socket, otherwise rootful.
 DOCKER_MODE="auto"
+# Rootful Docker, run as a normal user only: files owned by container users (root, database uids) are
+# read and restored by a short-lived root container using this image. It needs no sudo.
+HELPER_IMAGE="debian:stable-slim"
 
 # ---- Required ---------------------------------------------------------------
 # Folder holding one sub-folder per stack (each with a compose.yaml).
@@ -52,9 +58,9 @@ TAR_COMPRESSION="zstd"      # zstd (falls back to gzip when zstd is not installe
 BORG_REPO=""
 # Command that prints the repo passphrase. Keep that file mode 0600.
 BORG_PASSCOMMAND="cat /home/you/.config/stackctl/borg-passphrase"
-# Borg over SSH. In rootless Docker, Borg runs inside Docker's user namespace, where root-owned
+# Borg over SSH. With rootless Docker, Borg runs inside Docker's user namespace, where root-owned
 # files (/etc/ssh) appear as "nobody" and ssh looks for known_hosts under /root. So: own -F config
-# file, explicit known_hosts. In rootful mode a plain "ssh -i KEY" is enough.
+# file, explicit known_hosts. With rootful Docker a plain "ssh -i KEY -o UserKnownHostsFile=..." is enough.
 #BORG_RSH="ssh -F /home/you/.config/stackctl/ssh_config -i /home/you/.ssh/borg -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=/home/you/.config/stackctl/known_hosts-borg"
 # Remote borg binary, if it is not called "borg" on the host (for example "borg-1.4").
 BORG_REMOTE_PATH=""

@@ -2,10 +2,13 @@
 
 This guide covers setup and day-to-day use. The [README](../README.md) has the command list.
 
-The examples use rootless paths. For rootful Docker, use `/etc/stackctl` instead of `~/.config/stackctl`,
-`/var/lib/stackctl` instead of `~/.local/state/stackctl`, and leave out `--user` from `systemctl` and
-`journalctl`. In rootful mode, container-owned files are read and restored as root with their numeric owners
-kept, so there is no `nsenter` step and no lingering.
+The examples are for a normal user, such as a service account, and use paths in its home folder. If you run
+stackctl as root, use `/etc/stackctl` instead of `~/.config/stackctl`, `/var/lib/stackctl` instead of
+`~/.local/state/stackctl`, and leave out `--user` from `systemctl` and `journalctl`.
+
+Rootless or rootful Docker only changes how stackctl reaches files owned by container users. With rootless
+Docker it uses `nsenter`. With rootful Docker as a normal user it uses a short-lived root container (the
+`HELPER_IMAGE` setting), which needs no sudo. With rootful Docker as root it reads them directly.
 
 ## How it works
 
@@ -53,25 +56,28 @@ Each backup contains a stack's folder, including bind-mounted data inside it.
 ## 1. Install
 
 Run `./install.sh` from a checkout of a release tag. It covers steps 1 to 7 of this guide interactively. To
-do it by hand, install the script as root:
+do it by hand, install the script with root or sudo:
 
 ```bash
-install -m 0755 stackctl /usr/local/bin/stackctl
+sudo install -m 0755 -o root -g root stackctl /usr/local/bin/stackctl
 ```
+
+Without sudo, install it to `~/.local/bin/stackctl` instead and change `ExecStart` in the three `.service` files
+to match. The timers then run a script that the account can edit.
 
 Then create the config file and install the units.
 
-Rootless, as the Docker user:
+As a normal user (rootless Docker, or rootful as a service account):
 
 ```bash
 mkdir -p ~/.config/stackctl ~/.config/systemd/user
 cp stackctl.conf.example ~/.config/stackctl/stackctl.conf
 chmod 600 ~/.config/stackctl/stackctl.conf
 cp systemd/* ~/.config/systemd/user/ && systemctl --user daemon-reload
-loginctl enable-linger "$USER"      # needs sudo on some systems
+loginctl enable-linger "$USER"      # needs root or sudo; the timers stop when you log out without it
 ```
 
-Rootful, as root:
+As root:
 
 ```bash
 mkdir -p /etc/stackctl && chmod 700 /etc/stackctl
@@ -79,7 +85,9 @@ cp stackctl.conf.example /etc/stackctl/stackctl.conf && chmod 600 /etc/stackctl/
 cp systemd/* /etc/systemd/system/ && systemctl daemon-reload
 ```
 
-Edit the config file. Set at least `STACKS_DIR`, `GIT_REMOTE`, and either `BORG_REPO` or `BACKUP_DIR`.
+Edit the config file. Set at least `STACKS_DIR`, `GIT_REMOTE`, and either `BORG_REPO` or `BACKUP_DIR`. For rootful
+Docker as a normal user, also set `DOCKER_MODE="rootful"`, and pull the helper image once with
+`docker pull debian:stable-slim`.
 Leave the timers off for now.
 
 ## 2. Give the server read access to the repository
@@ -259,7 +267,12 @@ nsenter -U --preserve-credentials -t "$(cat /run/user/$(id -u)/docker.pid)" -- \
   chown -R 1000:1000 ~/stacks/app/data
 ```
 
-On rootful Docker, run a plain `chown -R 1000:1000` as root.
+On rootful Docker, use `sudo chown -R 1000:1000 ~/stacks/app/data`. Without sudo, run the same command in a
+root container:
+
+```bash
+docker run --rm -v "$HOME/stacks:$HOME/stacks" debian:stable-slim chown -R 1000:1000 "$HOME/stacks/app/data"
+```
 
 ### Adopt the stacks
 
