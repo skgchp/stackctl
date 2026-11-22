@@ -3,6 +3,15 @@
 Breaking changes to the config keys, unit names, paths or `stackctl version` output bump the major
 version (see AGENTS.md).
 
+## 2.1.1
+
+Fixed:
+- Backups and restores that use the rootful helper container (a normal user in the `docker` group) no longer fill
+  the disk. The helper streams the whole stack through its stdout, and Docker's default `json-file` log driver
+  also wrote that stream to disk (about 4x the data size) until the container was removed, so a large stack
+  failed with `No space left on device` at the end of the backup even though `df` showed free space, and the
+  stack was restarted unchanged. The helper now runs with `--log-driver none`. Nothing else changes.
+
 ## 2.1.0
 
 stackctl now runs as a normal service account against rootful Docker, with no sudo. **Existing installs keep
