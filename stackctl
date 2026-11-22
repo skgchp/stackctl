@@ -11,7 +11,7 @@
 
 set -Eeuo pipefail
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 COMPOSE_NAMES=(compose.yaml compose.yml docker-compose.yaml docker-compose.yml)
 STACK_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 HOST="$(hostname -s)"
@@ -259,9 +259,12 @@ use_helper() { [[ $MODE == rootful ]] && (( EUID != 0 )); }
 
 # Stdin is only forwarded when the caller sets HELPER_STDIN=1, so a command inside a "while read" loop
 # cannot swallow the loop's input.
+# --log-driver none: backups stream whole stacks through the helper's stdout, and Docker's default json-file
+# driver would also write that stream to disk (about 4x its size, JSON-escaped) until the container is removed,
+# which fills the disk on large stacks and fails the backup with ENOSPC.
 helper() {
   local d
-  local -a args=(--rm --user 0 --network none --read-only --security-opt no-new-privileges -w "$PWD")
+  local -a args=(--rm --user 0 --network none --read-only --log-driver none --security-opt no-new-privileges -w "$PWD")
   if [[ ${HELPER_STDIN:-} == 1 ]]; then args+=(-i); fi
   for d in "${HELPER_MOUNTS[@]}"; do args+=(-v "$d:$d"); done
   docker run "${args[@]}" "$HELPER_IMAGE" "$@"
